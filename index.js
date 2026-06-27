@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { appendFile } from 'fs';
 
-// Разрешаем самоподписанные сертификаты (для тестирования)
+// Разрешаем самоподписанные сертификаты (только для тестов с localtunnel)
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 dotenv.config();
@@ -66,9 +66,6 @@ if (Object.keys(questionsData).length === 0) {
 const logDir = join(__dirname, 'logs');
 if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
 
-/**
- * Записывает одну строку JSON в лог-файл.
- */
 const writeLog = (filename, data) => {
   const line = JSON.stringify({ timestamp: new Date().toISOString(), ...data }) + '\n';
   appendFile(join(logDir, filename), line, 'utf8', (err) => {
@@ -188,6 +185,19 @@ const sessions = new Map();
 async function handleStart(chatId, userId) {
   logger.user(userId);
 
+  const keyboard = {
+    keyboard: [
+      [{ text: '▶️ Начать тестирование', callback_data: 'start_test' }]
+    ]
+  };
+  await sendMessage(
+    chatId,
+    'Добро пожаловать в систему тестирования по промышленной безопасности!\n\nНажмите "Начать", чтобы выбрать тему.',
+    keyboard
+  );
+}
+
+async function showSubjects(chatId, userId) {
   sessions.set(userId, {
     state: 'SELECTING_SUBJECT',
     subject: null,
@@ -206,7 +216,7 @@ async function handleStart(chatId, userId) {
   };
   await sendMessage(
     chatId,
-    'Добро пожаловать в систему тестирования по промышленной безопасности!\n\nВыберите тему:',
+    'Выберите тему:',
     keyboard
   );
 }
@@ -230,8 +240,9 @@ async function handleSubjectSelection(chatId, userId, text) {
 
   const keyboard = {
     keyboard: [
-      [{ text: '📚 Обычный режим', callback_data: 'normal' }],
+      [{ text: '📚 Все вопросы', callback_data: 'normal' }],
       [{ text: '🎯 Тестовый режим (10 вопросов)', callback_data: 'test' }],
+      [{ text: '◀️ Назад', callback_data: 'back_to_subjects' }]
     ],
   };
   await sendMessage(
@@ -245,12 +256,14 @@ async function handleModeSelection(chatId, userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
-  const isNormal = text === 'normal' || text.includes('Обычный');
+  const isNormal = text === 'normal' || text.includes('Все вопросы');
   const isTest = text === 'test' || text.includes('Тестовый');
   if (!isNormal && !isTest) {
     await sendMessage(chatId, 'Пожалуйста, выберите режим, нажав на кнопку.');
     return;
   }
+
+  session.mode = isNormal ? 'normal' : 'test';
 
   const questions = questionsData[session.subject];
   if (!questions || questions.length === 0) {
@@ -295,7 +308,7 @@ async function sendQuestion(chatId, userId) {
   const keyboard = {
     keyboard: qData.options.map((_, i) => [{
       text: String(i+1),
-      callback_data: String(i),
+      callback_data: String(i+1),
     }]),
   };
   keyboard.keyboard.push([{ text: '🚫 Прервать тестирование', callback_data: 'cancel' }]);
@@ -339,10 +352,16 @@ async function handleAnswer(chatId, userId, text) {
     const total = session.questions.length;
     const score = session.score;
     const percentage = (score / total) * 100;
-    let grade = 'Неудовлетворительно 😔';
-    if (percentage >= 90) grade = 'Отлично! 🎉';
-    else if (percentage >= 75) grade = 'Хорошо! 👍';
-    else if (percentage >= 60) grade = 'Удовлетворительно 👌';
+    let grade;
+    if (percentage === 100) {
+      grade = 'Отлично! 🎉';
+    } else if (percentage >= 90) {
+      grade = 'Хорошо! 👍';
+    } else if (percentage >= 80) {
+      grade = 'Удовлетворительно 👌';
+    } else {
+      grade = 'Неудовлетворительно 😔';
+    }
 
     const result =
       `🏁 **Тестирование завершено!**\n\n` +
@@ -381,15 +400,23 @@ async function handleWebhook(req, res) {
 
     console.log(`👤 Callback от пользователя ${userId}, payload: "${payload}"`);
 
-    // Обрабатываем callback как обычное текстовое сообщение
     if (text === '/start' || text === '/cancel') {
       await handleStart(chatId, userId);
+      return res.sendStatus(200);
+    }
+    if (text === 'start_test') {
+      await showSubjects(chatId, userId);
+      return res.sendStatus(200);
+    }
+    if (text === 'back_to_subjects') {
+      await showSubjects(chatId, userId);
       return res.sendStatus(200);
     }
 
     const session = sessions.get(userId);
     if (!session) {
-      await sendMessage(chatId, 'Начните с команды /start');
+      // Если сессии нет, показываем приветствие с кнопкой "Начать"
+      await handleStart(chatId, userId);
       return res.sendStatus(200);
     }
 
@@ -486,7 +513,8 @@ async function handleWebhook(req, res) {
 
   const session = sessions.get(userId);
   if (!session) {
-    await sendMessage(chatId, 'Начните с команды /start');
+    // Если сессии нет, показываем приветствие с кнопкой "Начать"
+    await handleStart(chatId, userId);
     return res.sendStatus(200);
   }
 
@@ -515,7 +543,7 @@ async function handleWebhook(req, res) {
 }
 
 // ============================
-//  8.  РЕГИСТРАЦИЯ ВЕБХУКА
+//  8.  РЕГИСТРАЦИЯ ВЕБХУКА (автоматическая, если задан WEBHOOK_URL)
 // ============================
 async function registerWebhook(url) {
   try {
@@ -533,8 +561,10 @@ async function registerWebhook(url) {
       }
     );
     console.log('✅ Вебхук успешно зарегистрирован:', response.data);
+    return true;
   } catch (error) {
     console.error('❌ Ошибка регистрации вебхука:', error.response?.data || error.message);
+    return false;
   }
 }
 
@@ -553,13 +583,25 @@ app.listen(PORT, async () => {
   const webhookUrl = process.env.WEBHOOK_URL;
   if (webhookUrl) {
     const fullUrl = webhookUrl.endsWith('/webhook') ? webhookUrl : `${webhookUrl}/webhook`;
-    await registerWebhook(fullUrl);
+    console.log(`🔄 Пытаемся автоматически зарегистрировать вебхук: ${fullUrl}`);
+    const registered = await registerWebhook(fullUrl);
+    if (registered) {
+      console.log('🎉 Бот готов к работе!');
+    } else {
+      console.log(`
+⚠️  Автоматическая регистрация не удалась.
+   Зарегистрируйте вебхук вручную в партнёрском кабинете MAX:
+   URL: ${fullUrl}
+   Типы обновлений: message_created, bot_started, message_callback
+      `);
+    }
   } else {
     console.log(`
-⚠️  Вебхук не зарегистрирован.
-   Укажите переменную окружения WEBHOOK_URL при запуске:
-   WEBHOOK_URL=https://ваш-адрес.ngrok.io node index.js
-   (или используйте localtunnel / bore)
+ℹ️  Переменная WEBHOOK_URL не задана.
+   Для тестирования через localtunnel/ngrok добавьте в .env:
+   WEBHOOK_URL=https://ваш-адрес.loca.lt
+
+   Или зарегистрируйте вебхук вручную в партнёрском кабинете MAX.
     `);
   }
 });
