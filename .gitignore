@@ -1,0 +1,40 @@
+# Зависимости (не коммитим!)
+node_modules/
+
+# Переменные окружения (секреты)
+.env
+.env.local
+.env.*.local
+
+# Логи (генерируются ботом)
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Временные файлы редакторов
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Файлы отчётности или тестов
+coverage/
+.nyc_output/
+
+# Файлы, создаваемые при сборке
+dist/
+build/
+*.pid
+*.seed
+*.pid.lock
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
