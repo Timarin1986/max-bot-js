@@ -4,7 +4,9 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { appendFile } from 'fs';
 
+// Разрешаем самоподписанные сертификаты (для тестирования)
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 dotenv.config();
@@ -12,6 +14,9 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// ============================
+//  1.  ПРОВЕРКА ТОКЕНА
+// ============================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
   console.error('❌ BOT_TOKEN не задан в .env');
@@ -19,17 +24,89 @@ if (!BOT_TOKEN) {
 }
 
 const API_BASE = 'https://platform-api2.max.ru';
-const questionsPath = join(__dirname, 'questions.json');
-let questionsData;
-try {
-  questionsData = JSON.parse(fs.readFileSync(questionsPath, 'utf-8'));
-} catch (err) {
-  console.error('❌ Ошибка чтения questions.json:', err.message);
+
+// ============================
+//  2.  ЗАГРУЗКА ВОПРОСОВ ИЗ ПАПКИ questions/
+// ============================
+const questionsPath = join(__dirname, 'questions');
+let questionsData = {};
+
+if (fs.existsSync(questionsPath)) {
+  const files = fs.readdirSync(questionsPath);
+  files.forEach(file => {
+    if (file.endsWith('.json')) {
+      const topicKey = file.replace('.json', '');
+      const filePath = join(questionsPath, file);
+      try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(content);
+        if (Array.isArray(parsed) && parsed.length) {
+          questionsData[topicKey] = parsed;
+          console.log(`✅ Загружена тема: ${topicKey} (${parsed.length} вопросов)`);
+        } else {
+          console.warn(`⚠️ Файл ${file} пуст или не массив.`);
+        }
+      } catch (err) {
+        console.error(`❌ Ошибка в ${file}:`, err.message);
+      }
+    }
+  });
+} else {
+  console.warn('⚠️ Папка questions/ не найдена. Создайте её и добавьте JSON-файлы.');
+}
+
+if (Object.keys(questionsData).length === 0) {
+  console.error('❌ Нет загруженных тем. Бот остановлен.');
   process.exit(1);
 }
 
-const sessions = new Map();
+// ============================
+//  3.  ЛОГГЕР
+// ============================
+const logDir = join(__dirname, 'logs');
+if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
 
+/**
+ * Записывает одну строку JSON в лог-файл.
+ */
+const writeLog = (filename, data) => {
+  const line = JSON.stringify({ timestamp: new Date().toISOString(), ...data }) + '\n';
+  appendFile(join(logDir, filename), line, 'utf8', (err) => {
+    if (err) console.error('Ошибка записи лога:', err);
+  });
+};
+
+const logger = {
+  action: (userId, action, subject = null, detail = null) =>
+    writeLog('actions.log', { userId, action, subject, detail }),
+  result: (userId, subject, score, total, percentage) =>
+    writeLog('results.log', { userId, subject, score, total, percentage }),
+  user: (userId) =>
+    writeLog('users.log', { userId, event: 'new_user' }),
+  error: (userId, error, context = null) =>
+    writeLog('errors.log', { userId, error, context }),
+};
+
+// Автоочистка логов старше 30 дней (раз в сутки)
+setInterval(() => {
+  const now = Date.now();
+  try {
+    fs.readdirSync(logDir)
+      .map(file => join(logDir, file))
+      .filter(filePath => {
+        const stats = fs.statSync(filePath);
+        return (now - stats.mtimeMs) > 30 * 24 * 60 * 60 * 1000;
+      })
+      .forEach(filePath => {
+        fs.unlinkSync(filePath);
+        console.log(`🗑️ Удалён старый лог: ${filePath}`);
+      });
+  } catch (_) { /* тихо */ }
+}, 24 * 60 * 60 * 1000);
+
+// ============================
+//  4.  ФУНКЦИИ ДЛЯ РАБОТЫ С API MAX
+// ============================
 async function callAPI(method, params = {}) {
   const url = `${API_BASE}/${method}`;
   console.log(`📤 Отправка запроса к ${url}`, JSON.stringify(params, null, 2));
@@ -76,31 +153,41 @@ async function sendMessage(chatId, text, replyMarkup = null) {
   return callAPI(`messages?user_id=${chatId}`, params);
 }
 
+// ============================
+//  5.  ОТОБРАЖЕНИЕ НАЗВАНИЙ ТЕМ
+// ============================
 function getSubjectDisplay(key) {
   const map = {
-    gas: '🔥 Природный газ',
-    ammonia: '☠️ Аммиак',
-    acetylene: '⚡ Ацетилен/Кислород',
-    chlorine: '☣️ Хлор',
-    lulki: '🛗 Люльки',
-    vessels: '⚓ Сосуды под давлением',
+    natural_gas_questions: '🔥 Природный газ',
+    ammonia_questions: '☠️ Аммиак',
+    acetylene_questions: '⚡ Ацетилен/Кислород',
+    chlorine_questions: '☣️ Хлор',
+    work_platforms_questions: '🛗 Люльки',
+    pressure_vessels_questions: '⚓ Сосуды под давлением',
   };
-  return map[key] || key;
+  return map[key] || key.replace(/_questions$/, '').replace(/_/g, ' ');
 }
 
 function getSubjectName(key) {
   const map = {
-    gas: 'природному газу',
-    ammonia: 'аммиаку',
-    acetylene: 'ацетилену и кислороду',
-    chlorine: 'хлору',
-    lulki: 'подъемникам (люлькам)',
-    vessels: 'сосудам под давлением',
+    natural_gas_questions: 'природному газу',
+    ammonia_questions: 'аммиаку',
+    acetylene_questions: 'ацетилену и кислороду',
+    chlorine_questions: 'хлору',
+    work_platforms_questions: 'подъемникам (люлькам)',
+    pressure_vessels_questions: 'сосудам под давлением',
   };
-  return map[key] || key;
+  return map[key] || key.replace(/_questions$/, '');
 }
 
+// ============================
+//  6.  ОБРАБОТЧИКИ СООБЩЕНИЙ
+// ============================
+const sessions = new Map();
+
 async function handleStart(chatId, userId) {
+  logger.user(userId);
+
   sessions.set(userId, {
     state: 'SELECTING_SUBJECT',
     subject: null,
@@ -112,7 +199,7 @@ async function handleStart(chatId, userId) {
 
   const subjects = Object.keys(questionsData);
   const keyboard = {
-    keyboard: subjects.map((s) => [{ 
+    keyboard: subjects.map((s) => [{
       text: getSubjectDisplay(s),
       callback_data: s,
     }]),
@@ -139,6 +226,7 @@ async function handleSubjectSelection(chatId, userId, text) {
 
   session.subject = selected;
   session.state = 'SELECTING_MODE';
+  logger.action(userId, 'select_subject', selected);
 
   const keyboard = {
     keyboard: [
@@ -187,6 +275,7 @@ async function handleModeSelection(chatId, userId, text) {
   session.currentQuestion = 0;
   session.score = 0;
   session.state = 'ANSWERING';
+  logger.action(userId, 'select_mode', session.subject, isNormal ? 'normal' : 'test');
 
   await sendQuestion(chatId, userId);
 }
@@ -204,7 +293,7 @@ async function sendQuestion(chatId, userId) {
   const optionsText = qData.options.map((opt, i) => `${i+1}. ${opt}`).join('\n');
 
   const keyboard = {
-    keyboard: qData.options.map((_, i) => [{ 
+    keyboard: qData.options.map((_, i) => [{
       text: String(i+1),
       callback_data: String(i),
     }]),
@@ -221,6 +310,7 @@ async function handleAnswer(chatId, userId, text) {
   if (text === 'cancel' || text === '🚫 Прервать тестирование') {
     sessions.delete(userId);
     await sendMessage(chatId, 'Тестирование прервано. Для начала нового используйте /start');
+    logger.action(userId, 'interrupt', session.subject);
     return;
   }
 
@@ -262,6 +352,7 @@ async function handleAnswer(chatId, userId, text) {
       `• Оценка: ${grade}\n\n` +
       `Для начала нового тестирования нажмите /start`;
 
+    logger.result(userId, session.subject, score, total, percentage);
     sessions.delete(userId);
     await sendMessage(chatId, result);
   } else {
@@ -269,13 +360,16 @@ async function handleAnswer(chatId, userId, text) {
   }
 }
 
+// ============================
+//  7.  ОБРАБОТЧИК ВЕБХУКА
+// ============================
 async function handleWebhook(req, res) {
   const update = req.body;
   console.log('📩 Получен вебхук:', JSON.stringify(update, null, 2));
 
   // Обработка callback-нажатий
   if (update.update_type === 'message_callback' && update.callback) {
-    const userId = update.callback.user?.user_id; // Исправлено: user, а не sender
+    const userId = update.callback.user?.user_id;
     const chatId = userId;
     const payload = update.callback.payload;
     const text = payload;
@@ -299,18 +393,25 @@ async function handleWebhook(req, res) {
       return res.sendStatus(200);
     }
 
-    switch (session.state) {
-      case 'SELECTING_SUBJECT':
-        await handleSubjectSelection(chatId, userId, text);
-        break;
-      case 'SELECTING_MODE':
-        await handleModeSelection(chatId, userId, text);
-        break;
-      case 'ANSWERING':
-        await handleAnswer(chatId, userId, text);
-        break;
-      default:
-        await sendMessage(chatId, 'Неизвестное состояние. Начните с /start');
+    try {
+      switch (session.state) {
+        case 'SELECTING_SUBJECT':
+          await handleSubjectSelection(chatId, userId, text);
+          break;
+        case 'SELECTING_MODE':
+          await handleModeSelection(chatId, userId, text);
+          break;
+        case 'ANSWERING':
+          await handleAnswer(chatId, userId, text);
+          break;
+        default:
+          await sendMessage(chatId, 'Неизвестное состояние. Начните с /start');
+      }
+    } catch (err) {
+      console.error('Ошибка обработки callback:', err);
+      logger.error(userId, err.message, 'callback');
+      await sendMessage(chatId, 'Произошла ошибка. Попробуйте /start заново.');
+      sessions.delete(userId);
     }
 
     return res.sendStatus(200);
@@ -333,8 +434,53 @@ async function handleWebhook(req, res) {
 
   console.log(`👤 Пользователь ${userId}, текст: "${text}"`);
 
-  if (text === '/start' || text === '/cancel') {
+  if (text === '/start') {
     await handleStart(chatId, userId);
+    return res.sendStatus(200);
+  }
+
+  if (text === '/stats') {
+    const adminId = parseInt(process.env.ADMIN_ID, 10) || 0;
+    if (userId !== adminId) {
+      await sendMessage(chatId, '⛔ Команда только для администратора.');
+      return res.sendStatus(200);
+    }
+
+    const resultsPath = join(logDir, 'results.log');
+    if (!fs.existsSync(resultsPath)) {
+      await sendMessage(chatId, '📭 Логов результатов пока нет.');
+      return res.sendStatus(200);
+    }
+
+    try {
+      const data = fs.readFileSync(resultsPath, 'utf8').trim().split('\n').filter(Boolean);
+      const totalTests = data.length;
+      const users = new Set(data.map(line => JSON.parse(line).userId));
+      const today = new Date().toISOString().slice(0, 10);
+      const todayTests = data.filter(line => line.includes(today));
+
+      await sendMessage(
+        chatId,
+        `📊 **Статистика бота:**\n` +
+        `👥 Всего тестировалось: ${users.size} чел.\n` +
+        `📝 Всего завершено тестов: ${totalTests}\n` +
+        `📅 Тестов за сегодня: ${todayTests.length}`
+      );
+    } catch (err) {
+      await sendMessage(chatId, 'Ошибка чтения статистики.');
+      logger.error(userId, err.message, 'stats');
+    }
+    return res.sendStatus(200);
+  }
+
+  if (text === '/cancel') {
+    if (sessions.has(userId)) {
+      sessions.delete(userId);
+      await sendMessage(chatId, '❌ Тестирование отменено. Для начала нового используйте /start');
+      logger.action(userId, 'cancel');
+    } else {
+      await sendMessage(chatId, 'У вас нет активного тестирования.');
+    }
     return res.sendStatus(200);
   }
 
@@ -344,23 +490,33 @@ async function handleWebhook(req, res) {
     return res.sendStatus(200);
   }
 
-  switch (session.state) {
-    case 'SELECTING_SUBJECT':
-      await handleSubjectSelection(chatId, userId, text);
-      break;
-    case 'SELECTING_MODE':
-      await handleModeSelection(chatId, userId, text);
-      break;
-    case 'ANSWERING':
-      await handleAnswer(chatId, userId, text);
-      break;
-    default:
-      await sendMessage(chatId, 'Неизвестное состояние. Начните с /start');
+  try {
+    switch (session.state) {
+      case 'SELECTING_SUBJECT':
+        await handleSubjectSelection(chatId, userId, text);
+        break;
+      case 'SELECTING_MODE':
+        await handleModeSelection(chatId, userId, text);
+        break;
+      case 'ANSWERING':
+        await handleAnswer(chatId, userId, text);
+        break;
+      default:
+        await sendMessage(chatId, 'Неизвестное состояние. Начните с /start');
+    }
+  } catch (err) {
+    console.error('Ошибка обработки сообщения:', err);
+    logger.error(userId, err.message, 'message');
+    await sendMessage(chatId, 'Произошла ошибка. Попробуйте /start заново.');
+    sessions.delete(userId);
   }
 
   res.sendStatus(200);
 }
 
+// ============================
+//  8.  РЕГИСТРАЦИЯ ВЕБХУКА
+// ============================
 async function registerWebhook(url) {
   try {
     const response = await axios.post(
@@ -382,6 +538,9 @@ async function registerWebhook(url) {
   }
 }
 
+// ============================
+//  9.  ЗАПУСК СЕРВЕРА
+// ============================
 const app = express();
 app.use(express.json());
 app.post('/webhook', handleWebhook);
