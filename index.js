@@ -63,7 +63,7 @@ if (Object.keys(questionsData).length === 0) {
 // ============================
 //  3.  ЛОГГЕР
 // ============================
-const logDir = join(__dirname, 'logs');
+const logDir = join('/tmp', 'logs');
 if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
 
 const writeLog = (filename, data) => {
