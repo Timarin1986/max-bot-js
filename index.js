@@ -33,22 +33,30 @@ const STATS_FILE = join(__dirname, 'stats.json');
 function loadStats() {
   try {
     if (fs.existsSync(STATS_FILE)) {
-      return JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+      const data = fs.readFileSync(STATS_FILE, 'utf8');
+      const parsed = JSON.parse(data);
+      return Array.isArray(parsed) ? parsed : [];
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error('Ошибка чтения stats.json:', e);
+  }
   return [];
 }
 
 function saveStatsEntry(userId, subject, mode, score, total, percentage) {
-  const stats = loadStats();
-  stats.push({ userId, subject, mode, score, total, percentage, timestamp: Date.now() });
-  fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
-  // дублируем в лог
-  const logDir = join('/tmp', 'logs');
-  if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
-  appendFile(join(logDir, 'results.log'),
-    JSON.stringify({ timestamp: new Date().toISOString(), userId, subject, mode, score, total, percentage }) + '\n',
-    'utf8', () => {});
+  try {
+    let stats = loadStats();
+    stats.push({ userId, subject, mode, score, total, percentage, timestamp: Date.now() });
+    fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+  } catch (err) {
+    console.error('❌ Ошибка записи stats.json:', err);
+    // Дублируем в лог ошибок
+    const logDir = join('/tmp', 'logs');
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    appendFile(join(logDir, 'stats_error.log'),
+      JSON.stringify({ userId, subject, mode, score, total, percentage, error: err.message }) + '\n',
+      'utf8', () => {});
+  }
 }
 
 function getStats() {
@@ -117,15 +125,19 @@ if (Object.keys(questionsData).length === 0) {
 //  4.  ЛОГГЕР
 // ============================
 const logDir = join('/tmp', 'logs');
-if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
+if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
 const writeLog = (filename, data) => {
   appendFile(join(logDir, filename), JSON.stringify({ timestamp: new Date().toISOString(), ...data }) + '\n', 'utf8', () => {});
 };
 const logger = {
   action: (userId, action, subject = null, detail = null) => writeLog('actions.log', { userId, action, subject, detail }),
   result: (userId, subject, mode, score, total, percentage) => {
-    saveStatsEntry(userId, subject, mode, score, total, percentage);
-    writeLog('results.log', { userId, subject, mode, score, total, percentage });
+    try {
+      saveStatsEntry(userId, subject, mode, score, total, percentage);
+      writeLog('results.log', { userId, subject, mode, score, total, percentage });
+    } catch (err) {
+      console.error('❌ Ошибка сохранения результата:', err);
+    }
   },
   user: (userId) => writeLog('users.log', { userId, event: 'new_user' }),
   error: (userId, error, context = null) => writeLog('errors.log', { userId, error, context }),
