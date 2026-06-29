@@ -25,42 +25,54 @@ if (!BOT_TOKEN) {
 const API_BASE = 'https://platform-api2.max.ru';
 const ADMIN_ID = process.env.ADMIN_ID;
 
-// ============================
-//  2.  ХРАНИЛИЩЕ СТАТИСТИКИ (JSON)
-// ============================
-const STATS_FILE = join(__dirname, 'stats.json');
-
-function loadStats() {
-  try {
-    if (fs.existsSync(STATS_FILE)) {
-      const data = fs.readFileSync(STATS_FILE, 'utf8');
-      const parsed = JSON.parse(data);
-      return Array.isArray(parsed) ? parsed : [];
-    }
-  } catch (e) {
-    console.error('Ошибка чтения stats.json:', e);
-  }
-  return [];
+if (!ADMIN_ID) {
+  console.warn('⚠️ ADMIN_ID не задан – команды /stats и /check_size недоступны.');
 }
 
-function saveStatsEntry(userId, subject, mode, score, total, percentage) {
+// ============================
+//  2.  ХРАНИЛИЩЕ СТАТИСТИКИ (JSON Lines)
+// ============================
+const STATS_FILE = join('/tmp', 'stats.jsonl');
+
+async function saveStatsEntry(userId, subject, mode, score, total, percentage) {
+  const entry = JSON.stringify({
+    userId,
+    subject,
+    mode,
+    score,
+    total,
+    percentage,
+    timestamp: Date.now()
+  }) + '\n';
   try {
-    let stats = loadStats();
-    stats.push({ userId, subject, mode, score, total, percentage, timestamp: Date.now() });
-    fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+    await fsPromises.appendFile(STATS_FILE, entry, 'utf8');
   } catch (err) {
-    console.error('❌ Ошибка записи stats.json:', err);
-    // Дублируем в лог ошибок
+    console.error('❌ Ошибка записи stats.jsonl:', err);
+    // fallback в лог ошибок
     const logDir = join('/tmp', 'logs');
     if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
-    appendFile(join(logDir, 'stats_error.log'),
+    await fsPromises.appendFile(
+      join(logDir, 'stats_error.log'),
       JSON.stringify({ userId, subject, mode, score, total, percentage, error: err.message }) + '\n',
-      'utf8', () => {});
+      'utf8'
+    ).catch(() => {});
   }
 }
 
-function getStats() {
-  const stats = loadStats();
+async function loadStats() {
+  try {
+    const data = await fsPromises.readFile(STATS_FILE, 'utf8');
+    const lines = data.trim().split('\n').filter(Boolean);
+    return lines.map(line => JSON.parse(line));
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    console.error('Ошибка чтения stats.jsonl:', err);
+    return [];
+  }
+}
+
+async function getStats() {
+  const stats = await loadStats();
   if (stats.length === 0) {
     return { total: 0, users: 0, today: 0, bySubject: {}, byMode: { normal: 0, test: 0 }, topUsers: [] };
   }
@@ -93,9 +105,11 @@ async function checkStatsFileSize() {
     const stat = await fsPromises.stat(STATS_FILE);
     const sizeMB = stat.size / 1024 / 1024;
     if (sizeMB > 500) {
-      await sendMessage(ADMIN_ID, `⚠️ Размер stats.json достиг ${sizeMB.toFixed(1)} МБ. Рекомендуется очистить.`);
+      await sendMessage(ADMIN_ID, `⚠️ Размер stats.jsonl достиг ${sizeMB.toFixed(1)} МБ. Рекомендуется очистить.`);
     }
-  } catch (e) {}
+  } catch (e) {
+    // файл ещё не создан
+  }
 }
 
 // ============================
@@ -132,12 +146,10 @@ const writeLog = (filename, data) => {
 const logger = {
   action: (userId, action, subject = null, detail = null) => writeLog('actions.log', { userId, action, subject, detail }),
   result: (userId, subject, mode, score, total, percentage) => {
-    try {
-      saveStatsEntry(userId, subject, mode, score, total, percentage);
-      writeLog('results.log', { userId, subject, mode, score, total, percentage });
-    } catch (err) {
-      console.error('❌ Ошибка сохранения результата:', err);
-    }
+    // fire-and-forget
+    saveStatsEntry(userId, subject, mode, score, total, percentage)
+      .catch(err => console.error('❌ Ошибка сохранения статистики:', err));
+    writeLog('results.log', { userId, subject, mode, score, total, percentage });
   },
   user: (userId) => writeLog('users.log', { userId, event: 'new_user' }),
   error: (userId, error, context = null) => writeLog('errors.log', { userId, error, context }),
@@ -450,7 +462,7 @@ async function handleWebhook(req, res) {
       return res.sendStatus(200);
     }
     try {
-      const stats = getStats();
+      const stats = await getStats();
       let response = `📊 **Статистика бота:**\n`;
       response += `👥 Всего тестировалось: ${stats.users} чел.\n`;
       response += `📝 Всего завершено тестов: ${stats.total}\n`;
@@ -481,7 +493,7 @@ async function handleWebhook(req, res) {
     }
     try {
       const stat = await fsPromises.stat(STATS_FILE);
-      await sendMessage(userId, `📦 Размер stats.json: **${(stat.size / 1024 / 1024).toFixed(1)} МБ**`);
+      await sendMessage(userId, `📦 Размер stats.jsonl: **${(stat.size / 1024 / 1024).toFixed(1)} МБ**`);
     } catch (e) {
       await sendMessage(userId, 'Файл статистики ещё не создан.');
     }
@@ -495,6 +507,10 @@ async function handleWebhook(req, res) {
 // ============================
 //  10. РЕГИСТРАЦИЯ ВЕБХУКА И ЗАПУСК
 // ============================
+const app = express();
+app.use(express.json());
+app.post('/webhook', handleWebhook);
+
 async function registerWebhook(url) {
   try {
     const response = await axios.post(`${API_BASE}/subscriptions`, {
@@ -513,24 +529,34 @@ async function registerWebhook(url) {
   }
 }
 
-const app = express();
-app.use(express.json());
-app.post('/webhook', handleWebhook);
+// Запуск сервера только если не в тестовом режиме
+if (process.env.NODE_ENV !== 'test') {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, async () => {
+    console.log(`✅ Сервер запущен на порту ${PORT}`);
+    console.log(`   Ожидаем вебхуки на /webhook`);
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`✅ Сервер запущен на порту ${PORT}`);
-  console.log(`   Ожидаем вебхуки на /webhook`);
+    setTimeout(async () => await checkStatsFileSize(), 5000);
+    setInterval(async () => await checkStatsFileSize(), 24 * 60 * 60 * 1000);
 
-  setTimeout(async () => await checkStatsFileSize(), 5000);
-  setInterval(async () => await checkStatsFileSize(), 24 * 60 * 60 * 1000);
+    const webhookUrl = process.env.WEBHOOK_URL;
+    if (webhookUrl) {
+      const fullUrl = webhookUrl.endsWith('/webhook') ? webhookUrl : `${webhookUrl}/webhook`;
+      console.log(`🔄 Регистрация вебхука: ${fullUrl}`);
+      await registerWebhook(fullUrl);
+    } else {
+      console.log('ℹ️ WEBHOOK_URL не задан. Зарегистрируйте вебхук вручную.');
+    }
+  });
+}
 
-  const webhookUrl = process.env.WEBHOOK_URL;
-  if (webhookUrl) {
-    const fullUrl = webhookUrl.endsWith('/webhook') ? webhookUrl : `${webhookUrl}/webhook`;
-    console.log(`🔄 Регистрация вебхука: ${fullUrl}`);
-    await registerWebhook(fullUrl);
-  } else {
-    console.log('ℹ️ WEBHOOK_URL не задан. Зарегистрируйте вебхук вручную.');
-  }
-});
+// ============================
+//  ЭКСПОРТЫ ДЛЯ ТЕСТОВ
+// ============================
+export { 
+  handleStart, showSubjects, handleSubjectSelection, handleModeSelection, 
+  startTest, handleAnswer, processUserAction, handleWebhook,
+  loadStats, saveStatsEntry, getStats, getSubjectDisplay, getSubjectName,
+  questionsData,
+  sessions
+};
