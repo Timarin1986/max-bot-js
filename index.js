@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { appendFile } from 'fs';
 import { promises as fsPromises } from 'fs';
-import sqlite3 from 'sqlite3';
+import Database from 'better-sqlite3';
 
 // Не используем глобальное отключение проверки SSL
 dotenv.config();
@@ -28,13 +28,13 @@ const API_BASE = 'https://platform-api2.max.ru';
 const ADMIN_ID = process.env.ADMIN_ID; // строка
 
 // ============================
-//  2.  ПОДКЛЮЧЕНИЕ К SQLite
+//  2.  ПОДКЛЮЧЕНИЕ К БД (better-sqlite3)
 // ============================
 const DB_PATH = join(__dirname, 'stats.db');
-const db = new sqlite3.Database(DB_PATH);
+const db = new Database(DB_PATH);
 
-// Создаём таблицу, если её нет
-db.run(`
+// Создаём таблицу, если её нет (синхронно)
+db.exec(`
   CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -46,11 +46,6 @@ db.run(`
     timestamp INTEGER NOT NULL
   )
 `);
-
-// Закрываем соединение при завершении процесса
-process.on('exit', () => db.close());
-process.on('SIGINT', () => { db.close(); process.exit(); });
-process.on('SIGTERM', () => { db.close(); process.exit(); });
 
 // ============================
 //  3.  ЗАГРУЗКА ВОПРОСОВ
@@ -88,7 +83,7 @@ if (Object.keys(questionsData).length === 0) {
 }
 
 // ============================
-//  4.  ЛОГГЕР (текстовые логи для действий)
+//  4.  ЛОГГЕР (текстовые логи + БД)
 // ============================
 const logDir = join('/tmp', 'logs');
 if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
@@ -104,17 +99,14 @@ const logger = {
   action: (userId, action, subject = null, detail = null) =>
     writeLog('actions.log', { userId, action, subject, detail }),
   result: (userId, subject, mode, score, total, percentage) => {
-    // Сохраняем в SQLite
+    // Сохраняем в SQLite (синхронно)
     const timestamp = Date.now();
-    db.run(
-      `INSERT INTO results (user_id, subject, mode, score, total, percentage, timestamp)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [userId, subject, mode, score, total, percentage, timestamp],
-      (err) => {
-        if (err) console.error('❌ Ошибка сохранения в БД:', err);
-      }
-    );
-    // Также пишем в файл для совместимости (опционально)
+    const stmt = db.prepare(`
+      INSERT INTO results (user_id, subject, mode, score, total, percentage, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(userId, subject, mode, score, total, percentage, timestamp);
+    // Также пишем в файл для совместимости
     writeLog('results.log', { userId, subject, mode, score, total, percentage });
   },
   user: (userId) =>
@@ -223,61 +215,48 @@ async function checkDbSize() {
   }
 }
 
-// Получение расширенной статистики
-async function getDetailedStats() {
-  return new Promise((resolve, reject) => {
-    const stats = {
-      total: 0,
-      users: 0,
-      today: 0,
-      bySubject: {},
-      byMode: { normal: 0, test: 0 },
-      topUsers: []
-    };
+// Получение расширенной статистики (синхронно)
+function getDetailedStats() {
+  const stats = {
+    total: 0,
+    users: 0,
+    today: 0,
+    bySubject: {},
+    byMode: { normal: 0, test: 0 },
+    topUsers: []
+  };
 
-    // Общее количество тестов
-    db.get(`SELECT COUNT(*) as count FROM results`, (err, row) => {
-      if (err) return reject(err);
-      stats.total = row.count;
+  // Общее количество тестов
+  const totalRow = db.prepare(`SELECT COUNT(*) as count FROM results`).get();
+  stats.total = totalRow.count;
 
-      // Уникальные пользователи
-      db.get(`SELECT COUNT(DISTINCT user_id) as count FROM results`, (err, row2) => {
-        if (err) return reject(err);
-        stats.users = row2.count;
+  // Уникальные пользователи
+  const usersRow = db.prepare(`SELECT COUNT(DISTINCT user_id) as count FROM results`).get();
+  stats.users = usersRow.count;
 
-        // Сегодняшние тесты
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        db.get(`SELECT COUNT(*) as count FROM results WHERE timestamp >= ?`, [todayStart.getTime()], (err, row3) => {
-          if (err) return reject(err);
-          stats.today = row3.count;
+  // Сегодняшние тесты
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const todayRow = db.prepare(`SELECT COUNT(*) as count FROM results WHERE timestamp >= ?`).get(todayStart.getTime());
+  stats.today = todayRow.count;
 
-          // По темам
-          db.all(`SELECT subject, COUNT(*) as count FROM results GROUP BY subject`, (err, rows) => {
-            if (err) return reject(err);
-            rows.forEach(r => {
-              stats.bySubject[r.subject] = r.count;
-            });
-
-            // По режимам
-            db.all(`SELECT mode, COUNT(*) as count FROM results GROUP BY mode`, (err, rows2) => {
-              if (err) return reject(err);
-              rows2.forEach(r => {
-                stats.byMode[r.mode] = r.count;
-              });
-
-              // Топ-5 пользователей
-              db.all(`SELECT user_id, COUNT(*) as count FROM results GROUP BY user_id ORDER BY count DESC LIMIT 5`, (err, rows3) => {
-                if (err) return reject(err);
-                stats.topUsers = rows3.map(r => ({ userId: r.user_id, count: r.count }));
-                resolve(stats);
-              });
-            });
-          });
-        });
-      });
-    });
+  // По темам
+  const subjectRows = db.prepare(`SELECT subject, COUNT(*) as count FROM results GROUP BY subject`).all();
+  subjectRows.forEach(r => {
+    stats.bySubject[r.subject] = r.count;
   });
+
+  // По режимам
+  const modeRows = db.prepare(`SELECT mode, COUNT(*) as count FROM results GROUP BY mode`).all();
+  modeRows.forEach(r => {
+    stats.byMode[r.mode] = r.count;
+  });
+
+  // Топ-5 пользователей
+  const topRows = db.prepare(`SELECT user_id, COUNT(*) as count FROM results GROUP BY user_id ORDER BY count DESC LIMIT 5`).all();
+  stats.topUsers = topRows.map(r => ({ userId: r.user_id, count: r.count }));
+
+  return stats;
 }
 
 // ============================
@@ -601,7 +580,7 @@ async function handleWebhook(req, res) {
       return res.sendStatus(200);
     }
     try {
-      const stats = await getDetailedStats();
+      const stats = getDetailedStats(); // теперь синхронно
       let response = `📊 **Статистика бота:**\n`;
       response += `👥 Всего тестировалось: ${stats.users} чел.\n`;
       response += `📝 Всего завершено тестов: ${stats.total}\n`;
