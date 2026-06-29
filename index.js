@@ -62,7 +62,22 @@ async function loadStats() {
   try {
     const data = await fsPromises.readFile(STATS_FILE, 'utf8');
     const lines = data.trim().split('\n').filter(Boolean);
-    return lines.map(line => JSON.parse(line));
+    const stats = [];
+    for (const line of lines) {
+      try {
+        stats.push(JSON.parse(line));
+      } catch (e) {
+        console.error('⚠️ Битая строка в stats.jsonl, пропускаем:', line.slice(0, 100));
+        const logDir = join('/tmp', 'logs');
+        if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+        await fsPromises.appendFile(
+          join(logDir, 'stats_parse_errors.log'),
+          `[${new Date().toISOString()}] ${line}\n`,
+          'utf8'
+        ).catch(() => {});
+      }
+    }
+    return stats;
   } catch (err) {
     if (err.code === 'ENOENT') return [];
     console.error('Ошибка чтения stats.jsonl:', err);
@@ -106,9 +121,7 @@ async function checkStatsFileSize() {
     if (sizeMB > 500) {
       await sendMessage(ADMIN_ID, `⚠️ Размер stats.jsonl достиг ${sizeMB.toFixed(1)} МБ. Рекомендуется очистить.`);
     }
-  } catch (e) {
-    // файл ещё не создан
-  }
+  } catch (e) {}
 }
 
 // ============================
@@ -173,12 +186,17 @@ async function callAPI(method, params = {}) {
   }
 }
 
-async function sendMessage(userId, text, replyMarkup = null) {
-  const safeText = escapeMarkdown(text);
+// Добавляем параметр escape (по умолчанию true)
+async function sendMessage(userId, text, replyMarkup = null, escape = true) {
+  const safeText = escape ? escapeMarkdown(text) : text;
   const params = { text: safeText, format: 'markdown' };
   if (replyMarkup && replyMarkup.keyboard) {
     const buttons = replyMarkup.keyboard.map(row =>
-      row.map(btn => ({ type: 'callback', text: escapeMarkdown(btn.text), payload: btn.callback_data || btn.text }))
+      row.map(btn => ({
+        type: 'callback',
+        text: escape ? escapeMarkdown(btn.text) : btn.text,
+        payload: btn.callback_data || btn.text,
+      }))
     );
     params.attachments = [{ type: 'inline_keyboard', payload: { buttons } }];
   }
@@ -223,13 +241,17 @@ const sessions = new Map();
 
 async function handleStart(userId) {
   logger.user(userId);
-  await sendMessage(userId, '**Добро пожаловать в систему подготовки к проверке знаний по промышленной безопасности и охране труда!** 🛡️\n\nЭтот бот поможет вам проверить свои знания по ключевым темам. Нажмите "Начать тестирование", чтобы выбрать тему.', {
-    keyboard: [[{ text: '▶️ Начать тестирование', callback_data: 'start_test' }]]
-  });
+  // Статическое приветствие с разметкой – экранирование отключаем
+  await sendMessage(
+    userId,
+    '**Добро пожаловать в систему подготовки к проверке знаний по промышленной безопасности и охране труда!** 🛡️\n\nЭтот бот поможет вам проверить свои знания по ключевым темам. Нажмите "Начать тестирование", чтобы выбрать тему.',
+    { keyboard: [[{ text: '▶️ Начать тестирование', callback_data: 'start_test' }]] },
+    false
+  );
 }
 
 async function showSubjects(userId) {
-  sessions.set(userId, { state: 'SELECTING_SUBJECT', subject: null, mode: null, currentQuestion: 0, score: 0, questions: [] });
+  sessions.set(userId, { state: 'SELECTING_SUBJECT', subject: null, mode: null, currentQuestion: 0, score: 0, questions: [], processing: false });
   const subjects = Object.keys(questionsData);
   await sendMessage(userId, 'Выберите тему:', {
     keyboard: subjects.map(s => [{ text: getSubjectDisplay(s), callback_data: s }])
@@ -248,13 +270,20 @@ async function handleSubjectSelection(userId, text) {
   session.subject = selected;
   session.state = 'SELECTING_MODE';
   logger.action(userId, 'select_subject', selected);
-  await sendMessage(userId, `Вы выбрали тему: ${getSubjectName(selected)}\n\nТеперь выберите режим тестирования:`, {
-    keyboard: [
-      [{ text: '📚 Все вопросы', callback_data: 'normal' }],
-      [{ text: '🎯 Тестовый режим (10 вопросов)', callback_data: 'test' }],
-      [{ text: '◀️ Назад', callback_data: 'back_to_subjects' }]
-    ]
-  });
+  // Название темы экранируем, остальной текст с разметкой оставляем
+  const subjectName = escapeMarkdown(getSubjectName(selected));
+  await sendMessage(
+    userId,
+    `Вы выбрали тему: **${subjectName}**\n\nТеперь выберите режим тестирования:`,
+    {
+      keyboard: [
+        [{ text: '📚 Все вопросы', callback_data: 'normal' }],
+        [{ text: '🎯 Тестовый режим (10 вопросов)', callback_data: 'test' }],
+        [{ text: '◀️ Назад', callback_data: 'back_to_subjects' }]
+      ]
+    },
+    false
+  );
 }
 
 async function startTest(userId, subject, mode) {
@@ -286,6 +315,7 @@ async function startTest(userId, subject, mode) {
     currentQuestion: 0,
     score: 0,
     questions: sequence,
+    processing: false,
   });
   logger.action(userId, 'start_test', subject, mode);
   await sendQuestion(userId);
@@ -321,6 +351,7 @@ async function sendQuestion(userId) {
   };
   keyboard.keyboard.push([{ text: '🚫 Прервать тестирование', callback_data: 'cancel' }]);
 
+  // Вопросы и варианты могут содержать спецсимволы – экранируем
   await sendMessage(userId, `${text}\n\n${optionsText}`, keyboard);
 }
 
@@ -328,76 +359,92 @@ async function handleAnswer(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
-  // Обработка "отмены"
+  if (session.processing) {
+    await sendMessage(userId, '⏳ Подождите, ваш предыдущий ответ ещё обрабатывается.');
+    return;
+  }
+
   if (text === 'cancel' || text === '🚫 Прервать тестирование') {
     sessions.delete(userId);
     logger.action(userId, 'interrupt', session.subject);
-    await handleStart(userId); // ✅ вместо отдельного сообщения
+    await handleStart(userId);
     return;
   }
 
-  // Парсим payload вида "q{номер вопроса}_{номер ответа}"
-  const match = text.match(/^q(\d+)_(\d+)$/);
-  if (!match) {
-    await sendMessage(userId, 'Неверный формат ответа. Пожалуйста, используйте кнопки.');
-    return;
-  }
+  session.processing = true;
+  try {
+    const match = text.match(/^q(\d+)_(\d+)$/);
+    if (!match) {
+      await sendMessage(userId, 'Неверный формат ответа. Пожалуйста, используйте кнопки.');
+      return;
+    }
 
-  const questionIndex = parseInt(match[1], 10);
-  const answerNum = parseInt(match[2], 10);
+    const questionIndex = parseInt(match[1], 10);
+    const answerNum = parseInt(match[2], 10);
 
-  // Проверяем, что ответ относится к текущему вопросу
-  if (questionIndex !== session.currentQuestion) {
-    await sendMessage(userId, '⏳ Этот ответ уже не актуален. Ответьте на текущий вопрос.');
-    await sendQuestion(userId);
-    return;
-  }
+    if (questionIndex !== session.currentQuestion) {
+      await sendMessage(userId, '⏳ Этот ответ уже не актуален. Ответьте на текущий вопрос.');
+      await sendQuestion(userId);
+      return;
+    }
 
-  const questions = questionsData[session.subject];
-  const qData = questions[session.questions[questionIndex]];
+    const questions = questionsData[session.subject];
+    const qData = questions[session.questions[questionIndex]];
 
-  if (isNaN(answerNum) || answerNum < 1 || answerNum > qData.options.length) {
-    await sendMessage(userId, 'Пожалуйста, выберите номер ответа (нажмите на кнопку с цифрой).');
-    return;
-  }
+    if (isNaN(answerNum) || answerNum < 1 || answerNum > qData.options.length) {
+      await sendMessage(userId, 'Пожалуйста, выберите номер ответа (нажмите на кнопку с цифрой).');
+      return;
+    }
 
-  const isCorrect = (answerNum - 1) === qData.correct;
-  if (isCorrect) {
-    session.score += 1;
-    await sendMessage(userId, '✅ **Правильно!**');
-  } else {
-    await sendMessage(userId, `❌ **Неправильно!**\nПравильный ответ: ${qData.options[qData.correct]}`);
-  }
+    const isCorrect = (answerNum - 1) === qData.correct;
+    if (isCorrect) {
+      session.score += 1;
+      await sendMessage(userId, '✅ **Правильно!**', null, false);
+    } else {
+      const correctText = escapeMarkdown(qData.options[qData.correct]);
+      await sendMessage(
+        userId,
+        `❌ **Неправильно!**\nПравильный ответ: ${correctText}`,
+        null,
+        false
+      );
+    }
 
-  session.currentQuestion += 1;
+    session.currentQuestion += 1;
 
-  if (session.currentQuestion >= session.questions.length) {
-    const total = session.questions.length;
-    const score = session.score;
-    const percentage = (score / total) * 100;
-    let grade;
-    if (percentage === 100) grade = 'Отлично! 🎉';
-    else if (percentage >= 90) grade = 'Хорошо! 👍';
-    else if (percentage >= 80) grade = 'Удовлетворительно 👌';
-    else grade = 'Неудовлетворительно 😔';
-    const resultText =
-      `🏁 **Тестирование завершено!**\n\n` +
-      `📊 Результаты по теме '${getSubjectName(session.subject)}':\n` +
-      `• Правильных ответов: ${score}/${total}\n` +
-      `• Процент выполнения: ${percentage.toFixed(1)}%\n` +
-      `• Оценка: ${grade}\n\n` +
-      `Выберите действие:`;
-    const keyboard = {
-      keyboard: [
-        [{ text: '🔄 Пройти ещё раз', callback_data: `retry:${session.subject}:${session.mode}` }],
-        [{ text: '📋 Выбрать другую тему', callback_data: 'choose_subject' }]
-      ]
-    };
-    logger.result(userId, session.subject, session.mode, score, total, percentage);
-    sessions.delete(userId);
-    await sendMessage(userId, resultText, keyboard);
-  } else {
-    await sendQuestion(userId);
+    if (session.currentQuestion >= session.questions.length) {
+      const total = session.questions.length;
+      const score = session.score;
+      const percentage = (score / total) * 100;
+      let grade;
+      if (percentage === 100) grade = 'Отлично! 🎉';
+      else if (percentage >= 90) grade = 'Хорошо! 👍';
+      else if (percentage >= 80) grade = 'Удовлетворительно 👌';
+      else grade = 'Неудовлетворительно 😔';
+
+      const subjectName = escapeMarkdown(getSubjectName(session.subject));
+      const resultText =
+        `🏁 **Тестирование завершено!**\n\n` +
+        `📊 Результаты по теме '**${subjectName}**':\n` +
+        `• Правильных ответов: ${score}/${total}\n` +
+        `• Процент выполнения: ${percentage.toFixed(1)}%\n` +
+        `• Оценка: ${grade}\n\n` +
+        `Выберите действие:`;
+
+      const keyboard = {
+        keyboard: [
+          [{ text: '🔄 Пройти ещё раз', callback_data: `retry:${session.subject}:${session.mode}` }],
+          [{ text: '📋 Выбрать другую тему', callback_data: 'choose_subject' }]
+        ]
+      };
+      logger.result(userId, session.subject, session.mode, score, total, percentage);
+      sessions.delete(userId);
+      await sendMessage(userId, resultText, keyboard, false);
+    } else {
+      await sendQuestion(userId);
+    }
+  } finally {
+    session.processing = false;
   }
 }
 
@@ -496,7 +543,8 @@ async function handleWebhook(req, res) {
       response += `📅 Тестов за сегодня: ${stats.today}\n\n`;
       response += `📈 **По темам:**\n`;
       for (const [subject, count] of Object.entries(stats.bySubject)) {
-        response += `  • ${getSubjectDisplay(subject)}: ${count}\n`;
+        const displayName = escapeMarkdown(getSubjectDisplay(subject));
+        response += `  • ${displayName}: ${count}\n`;
       }
       response += `\n📋 **По режимам:**\n`;
       response += `  • Все вопросы: ${stats.byMode.normal || 0}\n`;
@@ -505,7 +553,7 @@ async function handleWebhook(req, res) {
       stats.topUsers.forEach((u, i) => {
         response += `  ${i+1}. ID: ${u.userId} — ${u.count} тестов\n`;
       });
-      await sendMessage(userId, response);
+      await sendMessage(userId, response, null, false); // статистика без Markdown, но экранирование отключаем (она не содержит опасных символов)
     } catch (err) {
       await sendMessage(userId, 'Ошибка получения статистики.');
       logger.error(userId, err.message, 'stats');
@@ -520,7 +568,7 @@ async function handleWebhook(req, res) {
     }
     try {
       const stat = await fsPromises.stat(STATS_FILE);
-      await sendMessage(userId, `📦 Размер stats.jsonl: **${(stat.size / 1024 / 1024).toFixed(1)} МБ**`);
+      await sendMessage(userId, `📦 Размер stats.jsonl: **${(stat.size / 1024 / 1024).toFixed(1)} МБ**`, null, false);
     } catch (e) {
       await sendMessage(userId, 'Файл статистики ещё не создан.');
     }
