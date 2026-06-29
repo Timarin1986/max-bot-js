@@ -7,11 +7,8 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { appendFile } from 'fs';
 
-// Для тестов можно включить игнорирование SSL (НЕ РЕКОМЕНДУЕТСЯ в production)
-// Однако с 25 мая 2026 требуется валидный HTTPS-сертификат.
-// Если вы используете localtunnel/ngrok, они предоставляют валидные сертификаты.
-// Оставляем возможность для отладки:
-// process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // лучше не использовать
+// Отключаем проверку SSL (необходимо для работы на Timeweb с самоподписанными или проблемными сертификатами)
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 dotenv.config();
 
@@ -27,7 +24,6 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// Базовый URL API MAX (актуальный до 19.07.2026)
 const API_BASE = 'https://platform-api2.max.ru';
 
 // ============================
@@ -110,11 +106,9 @@ setInterval(() => {
 //  4.  ФУНКЦИИ ДЛЯ РАБОТЫ С API MAX
 // ============================
 
-// Создаём HTTPS-агент с опцией (для тестов можно отключить проверку, но лучше этого не делать)
-// Используем валидные сертификаты от системы, если они есть.
-// Для localtunnel/ngrok сертификаты доверенные, поэтому проблем нет.
+// Создаём HTTPS-агент с отключённой проверкой сертификата (для Timeweb)
 const httpsAgent = new https.Agent({
-  rejectUnauthorized: process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0' ? false : true
+  rejectUnauthorized: false
 });
 
 async function callAPI(method, params = {}) {
@@ -123,7 +117,7 @@ async function callAPI(method, params = {}) {
   try {
     const response = await axios.post(url, params, {
       headers: {
-        Authorization: BOT_TOKEN, // Без префикса Bearer
+        Authorization: BOT_TOKEN,
         'Content-Type': 'application/json',
       },
       httpsAgent,
@@ -140,20 +134,13 @@ async function callAPI(method, params = {}) {
   }
 }
 
-/**
- * Отправка сообщения пользователю
- * @param {number|string} userId - ID пользователя MAX
- * @param {string} text - Текст сообщения (поддерживает markdown)
- * @param {Object} replyMarkup - объект клавиатуры вида { keyboard: [...] } (см. формат MAX)
- */
 async function sendMessage(userId, text, replyMarkup = null) {
   const params = {
     text: text,
-    format: 'markdown', // поддержка markdown
+    format: 'markdown',
   };
 
   if (replyMarkup && replyMarkup.keyboard) {
-    // Преобразуем наш формат в формат MAX
     const buttons = replyMarkup.keyboard.map(row =>
       row.map(btn => ({
         type: 'callback',
@@ -203,7 +190,6 @@ function getSubjectName(key) {
 // ============================
 const sessions = new Map();
 
-// --- Стартовое приветствие ---
 async function handleStart(userId) {
   logger.user(userId);
 
@@ -219,7 +205,6 @@ async function handleStart(userId) {
   );
 }
 
-// --- Показать список тем ---
 async function showSubjects(userId) {
   sessions.set(userId, {
     state: 'SELECTING_SUBJECT',
@@ -244,7 +229,6 @@ async function showSubjects(userId) {
   );
 }
 
-// --- Обработка выбора темы ---
 async function handleSubjectSelection(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
@@ -276,7 +260,6 @@ async function handleSubjectSelection(userId, text) {
   );
 }
 
-// --- Запуск теста по теме и режиму (общая функция) ---
 async function startTest(userId, subject, mode) {
   const questions = questionsData[subject];
   if (!questions || questions.length === 0) {
@@ -310,7 +293,6 @@ async function startTest(userId, subject, mode) {
   await sendQuestion(userId);
 }
 
-// --- Обработка выбора режима ---
 async function handleModeSelection(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
@@ -327,7 +309,6 @@ async function handleModeSelection(userId, text) {
   await startTest(userId, subject, mode);
 }
 
-// --- Отправить вопрос ---
 async function sendQuestion(userId) {
   const session = sessions.get(userId);
   if (!session) return;
@@ -351,7 +332,6 @@ async function sendQuestion(userId) {
   await sendMessage(userId, `${text}\n\n${optionsText}`, keyboard);
 }
 
-// --- Обработка ответа на вопрос ---
 async function handleAnswer(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
@@ -439,7 +419,7 @@ async function handleWebhook(req, res) {
     }
     console.log(`👤 Callback от пользователя ${userId}, payload: "${payload}"`);
 
-    // Обработка команд и кнопок
+    // Обработка новых кнопок
     if (payload === '/start' || payload === '/cancel') {
       await handleStart(userId);
       return res.sendStatus(200);
@@ -473,7 +453,6 @@ async function handleWebhook(req, res) {
       return res.sendStatus(200);
     }
 
-    // Если нет активной сессии – показать приветствие
     const session = sessions.get(userId);
     if (!session) {
       await handleStart(userId);
@@ -519,13 +498,11 @@ async function handleWebhook(req, res) {
 
   console.log(`👤 Пользователь ${userId}, текст: "${text}"`);
 
-  // Команда /start
   if (text === '/start') {
     await handleStart(userId);
     return res.sendStatus(200);
   }
 
-  // Статистика для админа
   if (text === '/stats') {
     const adminId = parseInt(process.env.ADMIN_ID, 10) || 0;
     if (userId !== adminId) {
@@ -560,7 +537,6 @@ async function handleWebhook(req, res) {
     return res.sendStatus(200);
   }
 
-  // Отмена
   if (text === '/cancel') {
     if (sessions.has(userId)) {
       sessions.delete(userId);
@@ -572,7 +548,6 @@ async function handleWebhook(req, res) {
     return res.sendStatus(200);
   }
 
-  // Если нет активной сессии – показываем приветствие
   const session = sessions.get(userId);
   if (!session) {
     await handleStart(userId);
@@ -613,7 +588,6 @@ async function registerWebhook(url) {
       {
         url: url,
         update_types: ['message_created', 'bot_started', 'message_callback'],
-        // secret: 'your_secret' // опционально
       },
       {
         headers: {
@@ -643,10 +617,8 @@ app.listen(PORT, async () => {
   console.log(`✅ Сервер запущен на порту ${PORT}`);
   console.log(`   Ожидаем вебхуки на /webhook`);
 
-  // Если задан WEBHOOK_URL – пробуем зарегистрироваться автоматически
   const webhookUrl = process.env.WEBHOOK_URL;
   if (webhookUrl) {
-    // Убедимся, что URL оканчивается на /webhook (для единообразия)
     const fullUrl = webhookUrl.endsWith('/webhook') ? webhookUrl : `${webhookUrl}/webhook`;
     console.log(`🔄 Пытаемся автоматически зарегистрировать вебхук: ${fullUrl}`);
     const registered = await registerWebhook(fullUrl);
