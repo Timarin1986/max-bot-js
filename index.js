@@ -1,13 +1,17 @@
 import express from 'express';
 import axios from 'axios';
+import https from 'https';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { appendFile } from 'fs';
 
-// Для продакшена лучше удалить или закомментировать:
-// process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+// Для тестов можно включить игнорирование SSL (НЕ РЕКОМЕНДУЕТСЯ в production)
+// Однако с 25 мая 2026 требуется валидный HTTPS-сертификат.
+// Если вы используете localtunnel/ngrok, они предоставляют валидные сертификаты.
+// Оставляем возможность для отладки:
+// process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // лучше не использовать
 
 dotenv.config();
 
@@ -23,6 +27,7 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
+// Базовый URL API MAX (актуальный до 19.07.2026)
 const API_BASE = 'https://platform-api2.max.ru';
 
 // ============================
@@ -104,15 +109,24 @@ setInterval(() => {
 // ============================
 //  4.  ФУНКЦИИ ДЛЯ РАБОТЫ С API MAX
 // ============================
+
+// Создаём HTTPS-агент с опцией (для тестов можно отключить проверку, но лучше этого не делать)
+// Используем валидные сертификаты от системы, если они есть.
+// Для localtunnel/ngrok сертификаты доверенные, поэтому проблем нет.
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0' ? false : true
+});
+
 async function callAPI(method, params = {}) {
   const url = `${API_BASE}/${method}`;
   console.log(`📤 Отправка запроса к ${url}`, JSON.stringify(params, null, 2));
   try {
     const response = await axios.post(url, params, {
       headers: {
-        Authorization: BOT_TOKEN,
+        Authorization: BOT_TOKEN, // Без префикса Bearer
         'Content-Type': 'application/json',
       },
+      httpsAgent,
     });
     console.log(`✅ Ответ:`, response.data);
     return response.data;
@@ -126,13 +140,20 @@ async function callAPI(method, params = {}) {
   }
 }
 
-async function sendMessage(chatId, text, replyMarkup = null) {
+/**
+ * Отправка сообщения пользователю
+ * @param {number|string} userId - ID пользователя MAX
+ * @param {string} text - Текст сообщения (поддерживает markdown)
+ * @param {Object} replyMarkup - объект клавиатуры вида { keyboard: [...] } (см. формат MAX)
+ */
+async function sendMessage(userId, text, replyMarkup = null) {
   const params = {
     text: text,
-    format: 'markdown',
+    format: 'markdown', // поддержка markdown
   };
 
   if (replyMarkup && replyMarkup.keyboard) {
+    // Преобразуем наш формат в формат MAX
     const buttons = replyMarkup.keyboard.map(row =>
       row.map(btn => ({
         type: 'callback',
@@ -147,7 +168,7 @@ async function sendMessage(chatId, text, replyMarkup = null) {
     }];
   }
 
-  return callAPI(`messages?user_id=${chatId}`, params);
+  return callAPI(`messages?user_id=${userId}`, params);
 }
 
 // ============================
@@ -182,7 +203,8 @@ function getSubjectName(key) {
 // ============================
 const sessions = new Map();
 
-async function handleStart(chatId, userId) {
+// --- Стартовое приветствие ---
+async function handleStart(userId) {
   logger.user(userId);
 
   const keyboard = {
@@ -191,13 +213,14 @@ async function handleStart(chatId, userId) {
     ]
   };
   await sendMessage(
-    chatId,
+    userId,
     'Добро пожаловать в систему тестирования по промышленной безопасности!\n\nНажмите "Начать", чтобы выбрать тему.',
     keyboard
   );
 }
 
-async function showSubjects(chatId, userId) {
+// --- Показать список тем ---
+async function showSubjects(userId) {
   sessions.set(userId, {
     state: 'SELECTING_SUBJECT',
     subject: null,
@@ -215,13 +238,14 @@ async function showSubjects(chatId, userId) {
     }]),
   };
   await sendMessage(
-    chatId,
+    userId,
     'Выберите тему:',
     keyboard
   );
 }
 
-async function handleSubjectSelection(chatId, userId, text) {
+// --- Обработка выбора темы ---
+async function handleSubjectSelection(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
@@ -230,7 +254,7 @@ async function handleSubjectSelection(chatId, userId, text) {
     (s) => getSubjectDisplay(s) === text || s === text
   );
   if (!selected) {
-    await sendMessage(chatId, 'Пожалуйста, выберите тему из списка, нажав на кнопку.');
+    await sendMessage(userId, 'Пожалуйста, выберите тему из списка, нажав на кнопку.');
     return;
   }
 
@@ -246,17 +270,17 @@ async function handleSubjectSelection(chatId, userId, text) {
     ],
   };
   await sendMessage(
-    chatId,
+    userId,
     `Вы выбрали тему: ${getSubjectName(selected)}\n\nТеперь выберите режим тестирования:`,
     keyboard
   );
 }
 
-// НОВАЯ ФУНКЦИЯ: запуск теста по заданной теме и режиму
-async function startTest(chatId, userId, subject, mode) {
+// --- Запуск теста по теме и режиму (общая функция) ---
+async function startTest(userId, subject, mode) {
   const questions = questionsData[subject];
   if (!questions || questions.length === 0) {
-    await sendMessage(chatId, 'По этой теме нет вопросов. Попробуйте другую тему.');
+    await sendMessage(userId, 'По этой теме нет вопросов. Попробуйте другую тему.');
     return;
   }
 
@@ -283,28 +307,28 @@ async function startTest(chatId, userId, subject, mode) {
   };
   sessions.set(userId, session);
   logger.action(userId, 'start_test', subject, mode);
-  await sendQuestion(chatId, userId);
+  await sendQuestion(userId);
 }
 
-async function handleModeSelection(chatId, userId, text) {
+// --- Обработка выбора режима ---
+async function handleModeSelection(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
   const isNormal = text === 'normal' || text.includes('Все вопросы');
   const isTest = text === 'test' || text.includes('Тестовый');
   if (!isNormal && !isTest) {
-    await sendMessage(chatId, 'Пожалуйста, выберите режим, нажав на кнопку.');
+    await sendMessage(userId, 'Пожалуйста, выберите режим, нажав на кнопку.');
     return;
   }
 
   const mode = isNormal ? 'normal' : 'test';
   const subject = session.subject;
-
-  // Запускаем тест через новую функцию
-  await startTest(chatId, userId, subject, mode);
+  await startTest(userId, subject, mode);
 }
 
-async function sendQuestion(chatId, userId) {
+// --- Отправить вопрос ---
+async function sendQuestion(userId) {
   const session = sessions.get(userId);
   if (!session) return;
 
@@ -324,23 +348,24 @@ async function sendQuestion(chatId, userId) {
   };
   keyboard.keyboard.push([{ text: '🚫 Прервать тестирование', callback_data: 'cancel' }]);
 
-  await sendMessage(chatId, `${text}\n\n${optionsText}`, keyboard);
+  await sendMessage(userId, `${text}\n\n${optionsText}`, keyboard);
 }
 
-async function handleAnswer(chatId, userId, text) {
+// --- Обработка ответа на вопрос ---
+async function handleAnswer(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
   if (text === 'cancel' || text === '🚫 Прервать тестирование') {
     sessions.delete(userId);
-    await sendMessage(chatId, 'Тестирование прервано. Для начала нового используйте /start');
+    await sendMessage(userId, 'Тестирование прервано. Для начала нового используйте /start');
     logger.action(userId, 'interrupt', session.subject);
     return;
   }
 
   const answerNum = parseInt(text, 10);
   if (isNaN(answerNum) || answerNum < 1) {
-    await sendMessage(chatId, 'Пожалуйста, выберите номер ответа (нажмите на кнопку с цифрой).');
+    await sendMessage(userId, 'Пожалуйста, выберите номер ответа (нажмите на кнопку с цифрой).');
     return;
   }
 
@@ -351,10 +376,10 @@ async function handleAnswer(chatId, userId, text) {
 
   if (isCorrect) {
     session.score += 1;
-    await sendMessage(chatId, '✅ **Правильно!**');
+    await sendMessage(userId, '✅ **Правильно!**');
   } else {
     const correctText = qData.options[qData.correct];
-    await sendMessage(chatId, `❌ **Неправильно!**\nПравильный ответ: ${correctText}`);
+    await sendMessage(userId, `❌ **Неправильно!**\nПравильный ответ: ${correctText}`);
   }
 
   session.currentQuestion += 1;
@@ -374,7 +399,6 @@ async function handleAnswer(chatId, userId, text) {
       grade = 'Неудовлетворительно 😔';
     }
 
-    // ИЗМЕНЕНО: две кнопки вместо текста
     const resultText =
       `🏁 **Тестирование завершено!**\n\n` +
       `📊 Результаты по теме '${getSubjectName(session.subject)}':\n` +
@@ -392,9 +416,9 @@ async function handleAnswer(chatId, userId, text) {
 
     logger.result(userId, session.subject, score, total, percentage);
     sessions.delete(userId);
-    await sendMessage(chatId, resultText, keyboard);
+    await sendMessage(userId, resultText, keyboard);
   } else {
-    await sendQuestion(chatId, userId);
+    await sendQuestion(userId);
   }
 }
 
@@ -408,82 +432,74 @@ async function handleWebhook(req, res) {
   // Обработка callback-нажатий
   if (update.update_type === 'message_callback' && update.callback) {
     const userId = update.callback.user?.user_id;
-    const chatId = userId;
     const payload = update.callback.payload;
-    const text = payload;
-
     if (!userId) {
       console.error('❌ Не удалось определить userId');
       return res.sendStatus(200);
     }
-
     console.log(`👤 Callback от пользователя ${userId}, payload: "${payload}"`);
 
-    // --- НОВЫЕ ОБРАБОТЧИКИ для кнопок результата ---
-    if (text === 'choose_subject') {
-      await showSubjects(chatId, userId);
+    // Обработка команд и кнопок
+    if (payload === '/start' || payload === '/cancel') {
+      await handleStart(userId);
       return res.sendStatus(200);
     }
-
-    if (text.startsWith('retry:')) {
-      const parts = text.split(':');
+    if (payload === 'start_test') {
+      await showSubjects(userId);
+      return res.sendStatus(200);
+    }
+    if (payload === 'back_to_subjects') {
+      await showSubjects(userId);
+      return res.sendStatus(200);
+    }
+    if (payload === 'choose_subject') {
+      await showSubjects(userId);
+      return res.sendStatus(200);
+    }
+    if (payload.startsWith('retry:')) {
+      const parts = payload.split(':');
       if (parts.length === 3) {
         const subject = parts[1];
         const mode = parts[2];
         if (questionsData[subject]) {
-          await startTest(chatId, userId, subject, mode);
+          await startTest(userId, subject, mode);
         } else {
-          await sendMessage(chatId, 'Тема не найдена. Выберите тему заново.');
-          await showSubjects(chatId, userId);
+          await sendMessage(userId, 'Тема не найдена. Выберите тему заново.');
+          await showSubjects(userId);
         }
       } else {
-        await sendMessage(chatId, 'Ошибка формата. Попробуйте снова.');
+        await sendMessage(userId, 'Ошибка формата. Попробуйте снова.');
       }
       return res.sendStatus(200);
     }
-    // ---------------------------------------------
 
-    if (text === '/start' || text === '/cancel') {
-      await handleStart(chatId, userId);
-      return res.sendStatus(200);
-    }
-    if (text === 'start_test') {
-      await showSubjects(chatId, userId);
-      return res.sendStatus(200);
-    }
-    if (text === 'back_to_subjects') {
-      await showSubjects(chatId, userId);
-      return res.sendStatus(200);
-    }
-
+    // Если нет активной сессии – показать приветствие
     const session = sessions.get(userId);
     if (!session) {
-      // Если сессии нет, показываем приветствие с кнопкой "Начать"
-      await handleStart(chatId, userId);
+      await handleStart(userId);
       return res.sendStatus(200);
     }
 
     try {
       switch (session.state) {
         case 'SELECTING_SUBJECT':
-          await handleSubjectSelection(chatId, userId, text);
+          await handleSubjectSelection(userId, payload);
           break;
         case 'SELECTING_MODE':
-          await handleModeSelection(chatId, userId, text);
+          await handleModeSelection(userId, payload);
           break;
         case 'ANSWERING':
-          await handleAnswer(chatId, userId, text);
+          await handleAnswer(userId, payload);
           break;
         default:
-          await sendMessage(chatId, 'Неизвестное состояние. Начните с /start');
+          await sendMessage(userId, 'Неизвестное состояние. Начните с /start');
       }
     } catch (err) {
       console.error('Ошибка обработки callback:', err);
       logger.error(userId, err.message, 'callback');
-      await sendMessage(chatId, 'Произошла ошибка. Попробуйте /start заново.');
+      await sendMessage(userId, 'Произошла ошибка. Попробуйте /start заново.');
       sessions.delete(userId);
     }
-
     return res.sendStatus(200);
   }
 
@@ -494,7 +510,6 @@ async function handleWebhook(req, res) {
 
   const msg = update.message;
   const userId = msg.sender?.user_id;
-  const chatId = userId;
   const text = msg.body?.text || '';
 
   if (!userId) {
@@ -504,21 +519,23 @@ async function handleWebhook(req, res) {
 
   console.log(`👤 Пользователь ${userId}, текст: "${text}"`);
 
+  // Команда /start
   if (text === '/start') {
-    await handleStart(chatId, userId);
+    await handleStart(userId);
     return res.sendStatus(200);
   }
 
+  // Статистика для админа
   if (text === '/stats') {
     const adminId = parseInt(process.env.ADMIN_ID, 10) || 0;
     if (userId !== adminId) {
-      await sendMessage(chatId, '⛔ Команда только для администратора.');
+      await sendMessage(userId, '⛔ Команда только для администратора.');
       return res.sendStatus(200);
     }
 
     const resultsPath = join(logDir, 'results.log');
     if (!fs.existsSync(resultsPath)) {
-      await sendMessage(chatId, '📭 Логов результатов пока нет.');
+      await sendMessage(userId, '📭 Логов результатов пока нет.');
       return res.sendStatus(200);
     }
 
@@ -530,55 +547,56 @@ async function handleWebhook(req, res) {
       const todayTests = data.filter(line => line.includes(today));
 
       await sendMessage(
-        chatId,
+        userId,
         `📊 **Статистика бота:**\n` +
         `👥 Всего тестировалось: ${users.size} чел.\n` +
         `📝 Всего завершено тестов: ${totalTests}\n` +
         `📅 Тестов за сегодня: ${todayTests.length}`
       );
     } catch (err) {
-      await sendMessage(chatId, 'Ошибка чтения статистики.');
+      await sendMessage(userId, 'Ошибка чтения статистики.');
       logger.error(userId, err.message, 'stats');
     }
     return res.sendStatus(200);
   }
 
+  // Отмена
   if (text === '/cancel') {
     if (sessions.has(userId)) {
       sessions.delete(userId);
-      await sendMessage(chatId, '❌ Тестирование отменено. Для начала нового используйте /start');
+      await sendMessage(userId, '❌ Тестирование отменено. Для начала нового используйте /start');
       logger.action(userId, 'cancel');
     } else {
-      await sendMessage(chatId, 'У вас нет активного тестирования.');
+      await sendMessage(userId, 'У вас нет активного тестирования.');
     }
     return res.sendStatus(200);
   }
 
+  // Если нет активной сессии – показываем приветствие
   const session = sessions.get(userId);
   if (!session) {
-    // Если сессии нет, показываем приветствие с кнопкой "Начать"
-    await handleStart(chatId, userId);
+    await handleStart(userId);
     return res.sendStatus(200);
   }
 
   try {
     switch (session.state) {
       case 'SELECTING_SUBJECT':
-        await handleSubjectSelection(chatId, userId, text);
+        await handleSubjectSelection(userId, text);
         break;
       case 'SELECTING_MODE':
-        await handleModeSelection(chatId, userId, text);
+        await handleModeSelection(userId, text);
         break;
       case 'ANSWERING':
-        await handleAnswer(chatId, userId, text);
+        await handleAnswer(userId, text);
         break;
       default:
-        await sendMessage(chatId, 'Неизвестное состояние. Начните с /start');
+        await sendMessage(userId, 'Неизвестное состояние. Начните с /start');
     }
   } catch (err) {
     console.error('Ошибка обработки сообщения:', err);
     logger.error(userId, err.message, 'message');
-    await sendMessage(chatId, 'Произошла ошибка. Попробуйте /start заново.');
+    await sendMessage(userId, 'Произошла ошибка. Попробуйте /start заново.');
     sessions.delete(userId);
   }
 
@@ -586,7 +604,7 @@ async function handleWebhook(req, res) {
 }
 
 // ============================
-//  8.  РЕГИСТРАЦИЯ ВЕБХУКА (автоматическая, если задан WEBHOOK_URL)
+//  8.  РЕГИСТРАЦИЯ ВЕБХУКА
 // ============================
 async function registerWebhook(url) {
   try {
@@ -595,12 +613,14 @@ async function registerWebhook(url) {
       {
         url: url,
         update_types: ['message_created', 'bot_started', 'message_callback'],
+        // secret: 'your_secret' // опционально
       },
       {
         headers: {
           Authorization: BOT_TOKEN,
           'Content-Type': 'application/json',
         },
+        httpsAgent,
       }
     );
     console.log('✅ Вебхук успешно зарегистрирован:', response.data);
@@ -623,8 +643,10 @@ app.listen(PORT, async () => {
   console.log(`✅ Сервер запущен на порту ${PORT}`);
   console.log(`   Ожидаем вебхуки на /webhook`);
 
+  // Если задан WEBHOOK_URL – пробуем зарегистрироваться автоматически
   const webhookUrl = process.env.WEBHOOK_URL;
   if (webhookUrl) {
+    // Убедимся, что URL оканчивается на /webhook (для единообразия)
     const fullUrl = webhookUrl.endsWith('/webhook') ? webhookUrl : `${webhookUrl}/webhook`;
     console.log(`🔄 Пытаемся автоматически зарегистрировать вебхук: ${fullUrl}`);
     const registered = await registerWebhook(fullUrl);
