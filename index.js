@@ -6,9 +6,10 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { appendFile } from 'fs';
+import { promises as fsPromises } from 'fs';
 
-// Отключаем проверку SSL (необходимо для работы на Timeweb с самоподписанными или проблемными сертификатами)
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+// НЕ используем глобальное отключение проверки SSL, только агент для API MAX
+// process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 dotenv.config();
 
@@ -62,7 +63,7 @@ if (Object.keys(questionsData).length === 0) {
 }
 
 // ============================
-//  3.  ЛОГГЕР
+//  3.  ЛОГГЕР (асинхронный)
 // ============================
 const logDir = join('/tmp', 'logs');
 if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
@@ -85,20 +86,19 @@ const logger = {
     writeLog('errors.log', { userId, error, context }),
 };
 
-// Автоочистка логов старше 30 дней (раз в сутки)
-setInterval(() => {
+// Асинхронная очистка логов старше 30 дней (раз в сутки)
+setInterval(async () => {
   const now = Date.now();
   try {
-    fs.readdirSync(logDir)
-      .map(file => join(logDir, file))
-      .filter(filePath => {
-        const stats = fs.statSync(filePath);
-        return (now - stats.mtimeMs) > 30 * 24 * 60 * 60 * 1000;
-      })
-      .forEach(filePath => {
-        fs.unlinkSync(filePath);
+    const files = await fsPromises.readdir(logDir);
+    for (const file of files) {
+      const filePath = join(logDir, file);
+      const stats = await fsPromises.stat(filePath);
+      if ((now - stats.mtimeMs) > 30 * 24 * 60 * 60 * 1000) {
+        await fsPromises.unlink(filePath);
         console.log(`🗑️ Удалён старый лог: ${filePath}`);
-      });
+      }
+    }
   } catch (_) { /* тихо */ }
 }, 24 * 60 * 60 * 1000);
 
@@ -106,14 +106,12 @@ setInterval(() => {
 //  4.  ФУНКЦИИ ДЛЯ РАБОТЫ С API MAX
 // ============================
 
-// Создаём HTTPS-агент с отключённой проверкой сертификата (для Timeweb)
-const httpsAgent = new https.Agent({
-  rejectUnauthorized: false
-});
+// HTTPS-агент с отключённой проверкой сертификатов (только для API MAX)
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 async function callAPI(method, params = {}) {
   const url = `${API_BASE}/${method}`;
-  console.log(`📤 Отправка запроса к ${url}`, JSON.stringify(params, null, 2));
+  console.log(`📤 Отправка запроса к ${url} (без вывода данных)`);
   try {
     const response = await axios.post(url, params, {
       headers: {
@@ -121,22 +119,26 @@ async function callAPI(method, params = {}) {
         'Content-Type': 'application/json',
       },
       httpsAgent,
+      timeout: 10000, // 10 секунд
     });
-    console.log(`✅ Ответ:`, response.data);
+    console.log(`✅ Ответ получен (код ${response.status})`);
     return response.data;
   } catch (error) {
+    // Логируем только краткую информацию, без токена и конфига
     console.error(
       `❌ Ошибка вызова ${method}:`,
-      error.response?.status,
-      error.response?.data || error.message
+      error.response?.status || 'нет статуса',
+      error.response?.data?.error || error.message
     );
     throw error;
   }
 }
 
 async function sendMessage(userId, text, replyMarkup = null) {
+  // Экранируем текст для Markdown (чтобы избежать инъекций)
+  const safeText = escapeMarkdown(text);
   const params = {
-    text: text,
+    text: safeText,
     format: 'markdown',
   };
 
@@ -144,7 +146,7 @@ async function sendMessage(userId, text, replyMarkup = null) {
     const buttons = replyMarkup.keyboard.map(row =>
       row.map(btn => ({
         type: 'callback',
-        text: btn.text,
+        text: escapeMarkdown(btn.text), // тоже экранируем
         payload: btn.callback_data || btn.text,
       }))
     );
@@ -156,6 +158,13 @@ async function sendMessage(userId, text, replyMarkup = null) {
   }
 
   return callAPI(`messages?user_id=${userId}`, params);
+}
+
+// Простое экранирование спецсимволов Markdown
+function escapeMarkdown(text) {
+  if (!text) return '';
+  const specialChars = /([_*[\]()~`>#+\-=|{}.!])/g;
+  return text.replace(specialChars, '\\$1');
 }
 
 // ============================
@@ -261,6 +270,12 @@ async function handleSubjectSelection(userId, text) {
 }
 
 async function startTest(userId, subject, mode) {
+  // Проверяем допустимость mode
+  if (mode !== 'normal' && mode !== 'test') {
+    await sendMessage(userId, 'Некорректный режим. Попробуйте снова.');
+    return;
+  }
+
   const questions = questionsData[subject];
   if (!questions || questions.length === 0) {
     await sendMessage(userId, 'По этой теме нет вопросов. Попробуйте другую тему.');
@@ -270,7 +285,7 @@ async function startTest(userId, subject, mode) {
   let sequence;
   if (mode === 'normal') {
     sequence = questions.map((_, i) => i);
-  } else { // test
+  } else {
     const count = Math.min(10, questions.length);
     const shuffled = [...Array(questions.length).keys()];
     for (let i = shuffled.length - 1; i > 0; i--) {
@@ -297,14 +312,13 @@ async function handleModeSelection(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
-  const isNormal = text === 'normal' || text.includes('Все вопросы');
-  const isTest = text === 'test' || text.includes('Тестовый');
-  if (!isNormal && !isTest) {
+  // Разрешаем только строгие значения из callback_data
+  if (text !== 'normal' && text !== 'test') {
     await sendMessage(userId, 'Пожалуйста, выберите режим, нажав на кнопку.');
     return;
   }
 
-  const mode = isNormal ? 'normal' : 'test';
+  const mode = text; // 'normal' или 'test'
   const subject = session.subject;
   await startTest(userId, subject, mode);
 }
@@ -344,14 +358,16 @@ async function handleAnswer(userId, text) {
   }
 
   const answerNum = parseInt(text, 10);
-  if (isNaN(answerNum) || answerNum < 1) {
+  const questions = questionsData[session.subject];
+  const qIndex = session.currentQuestion;
+  const qData = questions[session.questions[qIndex]];
+
+  // Проверяем, что номер ответа в допустимом диапазоне
+  if (isNaN(answerNum) || answerNum < 1 || answerNum > qData.options.length) {
     await sendMessage(userId, 'Пожалуйста, выберите номер ответа (нажмите на кнопку с цифрой).');
     return;
   }
 
-  const questions = questionsData[session.subject];
-  const qIndex = session.currentQuestion;
-  const qData = questions[session.questions[qIndex]];
   const isCorrect = (answerNum - 1) === qData.correct;
 
   if (isCorrect) {
@@ -403,11 +419,75 @@ async function handleAnswer(userId, text) {
 }
 
 // ============================
-//  7.  ОБРАБОТЧИК ВЕБХУКА
+//  7.  ОБЩАЯ ЛОГИКА ОБРАБОТКИ ДЕЙСТВИЙ ПОЛЬЗОВАТЕЛЯ
+// ============================
+async function processUserAction(userId, payload) {
+  if (!userId) return;
+
+  // Команды
+  if (payload === '/start' || payload === '/cancel') {
+    await handleStart(userId);
+    return;
+  }
+  if (payload === 'start_test') {
+    await showSubjects(userId);
+    return;
+  }
+  if (payload === 'back_to_subjects' || payload === 'choose_subject') {
+    await showSubjects(userId);
+    return;
+  }
+  if (payload.startsWith('retry:')) {
+    const parts = payload.split(':');
+    if (parts.length === 3) {
+      const subject = parts[1];
+      const mode = parts[2];
+      if (questionsData[subject] && (mode === 'normal' || mode === 'test')) {
+        await startTest(userId, subject, mode);
+      } else {
+        await sendMessage(userId, 'Тема или режим не найдены. Выберите тему заново.');
+        await showSubjects(userId);
+      }
+    } else {
+      await sendMessage(userId, 'Ошибка формата. Попробуйте снова.');
+    }
+    return;
+  }
+
+  const session = sessions.get(userId);
+  if (!session) {
+    await handleStart(userId);
+    return;
+  }
+
+  try {
+    switch (session.state) {
+      case 'SELECTING_SUBJECT':
+        await handleSubjectSelection(userId, payload);
+        break;
+      case 'SELECTING_MODE':
+        await handleModeSelection(userId, payload);
+        break;
+      case 'ANSWERING':
+        await handleAnswer(userId, payload);
+        break;
+      default:
+        await sendMessage(userId, 'Неизвестное состояние. Начните с /start');
+    }
+  } catch (err) {
+    console.error('Ошибка обработки действия:', err);
+    logger.error(userId, err.message, 'action');
+    await sendMessage(userId, 'Произошла ошибка. Попробуйте /start заново.');
+    sessions.delete(userId);
+  }
+}
+
+// ============================
+//  8.  ОБРАБОТЧИК ВЕБХУКА
 // ============================
 async function handleWebhook(req, res) {
   const update = req.body;
-  console.log('📩 Получен вебхук:', JSON.stringify(update, null, 2));
+  console.log('📩 Получен вебхук (кратко):', JSON.stringify(update).slice(0, 200) + '...');
 
   // Обработка callback-нажатий
   if (update.update_type === 'message_callback' && update.callback) {
@@ -418,67 +498,7 @@ async function handleWebhook(req, res) {
       return res.sendStatus(200);
     }
     console.log(`👤 Callback от пользователя ${userId}, payload: "${payload}"`);
-
-    // Обработка новых кнопок
-    if (payload === '/start' || payload === '/cancel') {
-      await handleStart(userId);
-      return res.sendStatus(200);
-    }
-    if (payload === 'start_test') {
-      await showSubjects(userId);
-      return res.sendStatus(200);
-    }
-    if (payload === 'back_to_subjects') {
-      await showSubjects(userId);
-      return res.sendStatus(200);
-    }
-    if (payload === 'choose_subject') {
-      await showSubjects(userId);
-      return res.sendStatus(200);
-    }
-    if (payload.startsWith('retry:')) {
-      const parts = payload.split(':');
-      if (parts.length === 3) {
-        const subject = parts[1];
-        const mode = parts[2];
-        if (questionsData[subject]) {
-          await startTest(userId, subject, mode);
-        } else {
-          await sendMessage(userId, 'Тема не найдена. Выберите тему заново.');
-          await showSubjects(userId);
-        }
-      } else {
-        await sendMessage(userId, 'Ошибка формата. Попробуйте снова.');
-      }
-      return res.sendStatus(200);
-    }
-
-    const session = sessions.get(userId);
-    if (!session) {
-      await handleStart(userId);
-      return res.sendStatus(200);
-    }
-
-    try {
-      switch (session.state) {
-        case 'SELECTING_SUBJECT':
-          await handleSubjectSelection(userId, payload);
-          break;
-        case 'SELECTING_MODE':
-          await handleModeSelection(userId, payload);
-          break;
-        case 'ANSWERING':
-          await handleAnswer(userId, payload);
-          break;
-        default:
-          await sendMessage(userId, 'Неизвестное состояние. Начните с /start');
-      }
-    } catch (err) {
-      console.error('Ошибка обработки callback:', err);
-      logger.error(userId, err.message, 'callback');
-      await sendMessage(userId, 'Произошла ошибка. Попробуйте /start заново.');
-      sessions.delete(userId);
-    }
+    await processUserAction(userId, payload);
     return res.sendStatus(200);
   }
 
@@ -498,14 +518,10 @@ async function handleWebhook(req, res) {
 
   console.log(`👤 Пользователь ${userId}, текст: "${text}"`);
 
-  if (text === '/start') {
-    await handleStart(userId);
-    return res.sendStatus(200);
-  }
-
+  // Команда /stats (админская)
   if (text === '/stats') {
-    const adminId = parseInt(process.env.ADMIN_ID, 10) || 0;
-    if (userId !== adminId) {
+    const adminId = process.env.ADMIN_ID;
+    if (String(userId) !== adminId) {
       await sendMessage(userId, '⛔ Команда только для администратора.');
       return res.sendStatus(200);
     }
@@ -537,49 +553,13 @@ async function handleWebhook(req, res) {
     return res.sendStatus(200);
   }
 
-  if (text === '/cancel') {
-    if (sessions.has(userId)) {
-      sessions.delete(userId);
-      await sendMessage(userId, '❌ Тестирование отменено. Для начала нового используйте /start');
-      logger.action(userId, 'cancel');
-    } else {
-      await sendMessage(userId, 'У вас нет активного тестирования.');
-    }
-    return res.sendStatus(200);
-  }
-
-  const session = sessions.get(userId);
-  if (!session) {
-    await handleStart(userId);
-    return res.sendStatus(200);
-  }
-
-  try {
-    switch (session.state) {
-      case 'SELECTING_SUBJECT':
-        await handleSubjectSelection(userId, text);
-        break;
-      case 'SELECTING_MODE':
-        await handleModeSelection(userId, text);
-        break;
-      case 'ANSWERING':
-        await handleAnswer(userId, text);
-        break;
-      default:
-        await sendMessage(userId, 'Неизвестное состояние. Начните с /start');
-    }
-  } catch (err) {
-    console.error('Ошибка обработки сообщения:', err);
-    logger.error(userId, err.message, 'message');
-    await sendMessage(userId, 'Произошла ошибка. Попробуйте /start заново.');
-    sessions.delete(userId);
-  }
-
+  // Обработка остальных текстовых сообщений через общую логику
+  await processUserAction(userId, text);
   res.sendStatus(200);
 }
 
 // ============================
-//  8.  РЕГИСТРАЦИЯ ВЕБХУКА
+//  9.  РЕГИСТРАЦИЯ ВЕБХУКА
 // ============================
 async function registerWebhook(url) {
   try {
@@ -595,6 +575,7 @@ async function registerWebhook(url) {
           'Content-Type': 'application/json',
         },
         httpsAgent,
+        timeout: 10000,
       }
     );
     console.log('✅ Вебхук успешно зарегистрирован:', response.data);
@@ -606,7 +587,7 @@ async function registerWebhook(url) {
 }
 
 // ============================
-//  9.  ЗАПУСК СЕРВЕРА
+//  10. ЗАПУСК СЕРВЕРА
 // ============================
 const app = express();
 app.use(express.json());
