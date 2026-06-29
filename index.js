@@ -7,10 +7,9 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { appendFile } from 'fs';
 import { promises as fsPromises } from 'fs';
+import sqlite3 from 'sqlite3';
 
-// НЕ используем глобальное отключение проверки SSL, только агент для API MAX
-// process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
+// Не используем глобальное отключение проверки SSL
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -26,9 +25,35 @@ if (!BOT_TOKEN) {
 }
 
 const API_BASE = 'https://platform-api2.max.ru';
+const ADMIN_ID = process.env.ADMIN_ID; // строка
 
 // ============================
-//  2.  ЗАГРУЗКА ВОПРОСОВ ИЗ ПАПКИ questions/
+//  2.  ПОДКЛЮЧЕНИЕ К SQLite
+// ============================
+const DB_PATH = join(__dirname, 'stats.db');
+const db = new sqlite3.Database(DB_PATH);
+
+// Создаём таблицу, если её нет
+db.run(`
+  CREATE TABLE IF NOT EXISTS results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    percentage REAL NOT NULL,
+    timestamp INTEGER NOT NULL
+  )
+`);
+
+// Закрываем соединение при завершении процесса
+process.on('exit', () => db.close());
+process.on('SIGINT', () => { db.close(); process.exit(); });
+process.on('SIGTERM', () => { db.close(); process.exit(); });
+
+// ============================
+//  3.  ЗАГРУЗКА ВОПРОСОВ
 // ============================
 const questionsPath = join(__dirname, 'questions');
 let questionsData = {};
@@ -63,7 +88,7 @@ if (Object.keys(questionsData).length === 0) {
 }
 
 // ============================
-//  3.  ЛОГГЕР (асинхронный)
+//  4.  ЛОГГЕР (текстовые логи для действий)
 // ============================
 const logDir = join('/tmp', 'logs');
 if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
@@ -78,40 +103,34 @@ const writeLog = (filename, data) => {
 const logger = {
   action: (userId, action, subject = null, detail = null) =>
     writeLog('actions.log', { userId, action, subject, detail }),
-  result: (userId, subject, score, total, percentage) =>
-    writeLog('results.log', { userId, subject, score, total, percentage }),
+  result: (userId, subject, mode, score, total, percentage) => {
+    // Сохраняем в SQLite
+    const timestamp = Date.now();
+    db.run(
+      `INSERT INTO results (user_id, subject, mode, score, total, percentage, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [userId, subject, mode, score, total, percentage, timestamp],
+      (err) => {
+        if (err) console.error('❌ Ошибка сохранения в БД:', err);
+      }
+    );
+    // Также пишем в файл для совместимости (опционально)
+    writeLog('results.log', { userId, subject, mode, score, total, percentage });
+  },
   user: (userId) =>
     writeLog('users.log', { userId, event: 'new_user' }),
   error: (userId, error, context = null) =>
     writeLog('errors.log', { userId, error, context }),
 };
 
-// Асинхронная очистка логов старше 30 дней (раз в сутки)
-setInterval(async () => {
-  const now = Date.now();
-  try {
-    const files = await fsPromises.readdir(logDir);
-    for (const file of files) {
-      const filePath = join(logDir, file);
-      const stats = await fsPromises.stat(filePath);
-      if ((now - stats.mtimeMs) > 30 * 24 * 60 * 60 * 1000) {
-        await fsPromises.unlink(filePath);
-        console.log(`🗑️ Удалён старый лог: ${filePath}`);
-      }
-    }
-  } catch (_) { /* тихо */ }
-}, 24 * 60 * 60 * 1000);
-
 // ============================
-//  4.  ФУНКЦИИ ДЛЯ РАБОТЫ С API MAX
+//  5.  ФУНКЦИИ ДЛЯ РАБОТЫ С API MAX
 // ============================
-
-// HTTPS-агент с отключённой проверкой сертификатов (только для API MAX)
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 async function callAPI(method, params = {}) {
   const url = `${API_BASE}/${method}`;
-  console.log(`📤 Отправка запроса к ${url} (без вывода данных)`);
+  console.log(`📤 Отправка запроса к ${url}`);
   try {
     const response = await axios.post(url, params, {
       headers: {
@@ -119,12 +138,11 @@ async function callAPI(method, params = {}) {
         'Content-Type': 'application/json',
       },
       httpsAgent,
-      timeout: 10000, // 10 секунд
+      timeout: 10000,
     });
     console.log(`✅ Ответ получен (код ${response.status})`);
     return response.data;
   } catch (error) {
-    // Логируем только краткую информацию, без токена и конфига
     console.error(
       `❌ Ошибка вызова ${method}:`,
       error.response?.status || 'нет статуса',
@@ -135,7 +153,6 @@ async function callAPI(method, params = {}) {
 }
 
 async function sendMessage(userId, text, replyMarkup = null) {
-  // Экранируем текст для Markdown (чтобы избежать инъекций)
   const safeText = escapeMarkdown(text);
   const params = {
     text: safeText,
@@ -146,21 +163,18 @@ async function sendMessage(userId, text, replyMarkup = null) {
     const buttons = replyMarkup.keyboard.map(row =>
       row.map(btn => ({
         type: 'callback',
-        text: escapeMarkdown(btn.text), // тоже экранируем
+        text: escapeMarkdown(btn.text),
         payload: btn.callback_data || btn.text,
       }))
     );
-
     params.attachments = [{
       type: 'inline_keyboard',
       payload: { buttons },
     }];
   }
-
   return callAPI(`messages?user_id=${userId}`, params);
 }
 
-// Простое экранирование спецсимволов Markdown
 function escapeMarkdown(text) {
   if (!text) return '';
   const specialChars = /([_*[\]()~`>#+\-=|{}.!])/g;
@@ -168,7 +182,7 @@ function escapeMarkdown(text) {
 }
 
 // ============================
-//  5.  ОТОБРАЖЕНИЕ НАЗВАНИЙ ТЕМ
+//  6.  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ============================
 function getSubjectDisplay(key) {
   const map = {
@@ -194,14 +208,85 @@ function getSubjectName(key) {
   return map[key] || key.replace(/_questions$/, '');
 }
 
+// Проверка размера БД
+async function checkDbSize() {
+  if (!ADMIN_ID) return;
+  try {
+    const stats = await fsPromises.stat(DB_PATH);
+    const sizeMB = stats.size / 1024 / 1024;
+    if (sizeMB > 500) {
+      const message = `⚠️ **Внимание!**\nРазмер базы данных статистики достиг **${sizeMB.toFixed(1)} МБ**.\nРекомендуется очистить или выгрузить данные.\nДля очистки используйте /clear_stats (если реализовано).`;
+      await sendMessage(ADMIN_ID, message);
+    }
+  } catch (err) {
+    console.error('Ошибка проверки размера БД:', err);
+  }
+}
+
+// Получение расширенной статистики
+async function getDetailedStats() {
+  return new Promise((resolve, reject) => {
+    const stats = {
+      total: 0,
+      users: 0,
+      today: 0,
+      bySubject: {},
+      byMode: { normal: 0, test: 0 },
+      topUsers: []
+    };
+
+    // Общее количество тестов
+    db.get(`SELECT COUNT(*) as count FROM results`, (err, row) => {
+      if (err) return reject(err);
+      stats.total = row.count;
+
+      // Уникальные пользователи
+      db.get(`SELECT COUNT(DISTINCT user_id) as count FROM results`, (err, row2) => {
+        if (err) return reject(err);
+        stats.users = row2.count;
+
+        // Сегодняшние тесты
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        db.get(`SELECT COUNT(*) as count FROM results WHERE timestamp >= ?`, [todayStart.getTime()], (err, row3) => {
+          if (err) return reject(err);
+          stats.today = row3.count;
+
+          // По темам
+          db.all(`SELECT subject, COUNT(*) as count FROM results GROUP BY subject`, (err, rows) => {
+            if (err) return reject(err);
+            rows.forEach(r => {
+              stats.bySubject[r.subject] = r.count;
+            });
+
+            // По режимам
+            db.all(`SELECT mode, COUNT(*) as count FROM results GROUP BY mode`, (err, rows2) => {
+              if (err) return reject(err);
+              rows2.forEach(r => {
+                stats.byMode[r.mode] = r.count;
+              });
+
+              // Топ-5 пользователей
+              db.all(`SELECT user_id, COUNT(*) as count FROM results GROUP BY user_id ORDER BY count DESC LIMIT 5`, (err, rows3) => {
+                if (err) return reject(err);
+                stats.topUsers = rows3.map(r => ({ userId: r.user_id, count: r.count }));
+                resolve(stats);
+              });
+            });
+          });
+        });
+      });
+    });
+  });
+}
+
 // ============================
-//  6.  ОБРАБОТЧИКИ СООБЩЕНИЙ
+//  7.  ОСНОВНАЯ ЛОГИКА БОТА
 // ============================
 const sessions = new Map();
 
 async function handleStart(userId) {
   logger.user(userId);
-
   const keyboard = {
     keyboard: [
       [{ text: '▶️ Начать тестирование', callback_data: 'start_test' }]
@@ -231,11 +316,7 @@ async function showSubjects(userId) {
       callback_data: s,
     }]),
   };
-  await sendMessage(
-    userId,
-    'Выберите тему:',
-    keyboard
-  );
+  await sendMessage(userId, 'Выберите тему:', keyboard);
 }
 
 async function handleSubjectSelection(userId, text) {
@@ -270,7 +351,6 @@ async function handleSubjectSelection(userId, text) {
 }
 
 async function startTest(userId, subject, mode) {
-  // Проверяем допустимость mode
   if (mode !== 'normal' && mode !== 'test') {
     await sendMessage(userId, 'Некорректный режим. Попробуйте снова.');
     return;
@@ -312,13 +392,12 @@ async function handleModeSelection(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
-  // Разрешаем только строгие значения из callback_data
   if (text !== 'normal' && text !== 'test') {
     await sendMessage(userId, 'Пожалуйста, выберите режим, нажав на кнопку.');
     return;
   }
 
-  const mode = text; // 'normal' или 'test'
+  const mode = text;
   const subject = session.subject;
   await startTest(userId, subject, mode);
 }
@@ -362,7 +441,6 @@ async function handleAnswer(userId, text) {
   const qIndex = session.currentQuestion;
   const qData = questions[session.questions[qIndex]];
 
-  // Проверяем, что номер ответа в допустимом диапазоне
   if (isNaN(answerNum) || answerNum < 1 || answerNum > qData.options.length) {
     await sendMessage(userId, 'Пожалуйста, выберите номер ответа (нажмите на кнопку с цифрой).');
     return;
@@ -410,7 +488,8 @@ async function handleAnswer(userId, text) {
       ]
     };
 
-    logger.result(userId, session.subject, score, total, percentage);
+    // Сохраняем результат в БД и лог
+    logger.result(userId, session.subject, session.mode, score, total, percentage);
     sessions.delete(userId);
     await sendMessage(userId, resultText, keyboard);
   } else {
@@ -419,12 +498,11 @@ async function handleAnswer(userId, text) {
 }
 
 // ============================
-//  7.  ОБЩАЯ ЛОГИКА ОБРАБОТКИ ДЕЙСТВИЙ ПОЛЬЗОВАТЕЛЯ
+//  8.  ОБЩАЯ ЛОГИКА ОБРАБОТКИ
 // ============================
 async function processUserAction(userId, payload) {
   if (!userId) return;
 
-  // Команды
   if (payload === '/start' || payload === '/cancel') {
     await handleStart(userId);
     return;
@@ -483,13 +561,12 @@ async function processUserAction(userId, payload) {
 }
 
 // ============================
-//  8.  ОБРАБОТЧИК ВЕБХУКА
+//  9.  ОБРАБОТЧИК ВЕБХУКА
 // ============================
 async function handleWebhook(req, res) {
   const update = req.body;
   console.log('📩 Получен вебхук (кратко):', JSON.stringify(update).slice(0, 200) + '...');
 
-  // Обработка callback-нажатий
   if (update.update_type === 'message_callback' && update.callback) {
     const userId = update.callback.user?.user_id;
     const payload = update.callback.payload;
@@ -502,7 +579,6 @@ async function handleWebhook(req, res) {
     return res.sendStatus(200);
   }
 
-  // Обработка текстовых сообщений
   if (!update || !update.message) {
     return res.sendStatus(200);
   }
@@ -518,48 +594,58 @@ async function handleWebhook(req, res) {
 
   console.log(`👤 Пользователь ${userId}, текст: "${text}"`);
 
-  // Команда /stats (админская)
+  // Админские команды
   if (text === '/stats') {
-    const adminId = process.env.ADMIN_ID;
-    if (String(userId) !== adminId) {
+    if (String(userId) !== ADMIN_ID) {
       await sendMessage(userId, '⛔ Команда только для администратора.');
       return res.sendStatus(200);
     }
-
-    const resultsPath = join(logDir, 'results.log');
-    if (!fs.existsSync(resultsPath)) {
-      await sendMessage(userId, '📭 Логов результатов пока нет.');
-      return res.sendStatus(200);
-    }
-
     try {
-      const data = fs.readFileSync(resultsPath, 'utf8').trim().split('\n').filter(Boolean);
-      const totalTests = data.length;
-      const users = new Set(data.map(line => JSON.parse(line).userId));
-      const today = new Date().toISOString().slice(0, 10);
-      const todayTests = data.filter(line => line.includes(today));
-
-      await sendMessage(
-        userId,
-        `📊 **Статистика бота:**\n` +
-        `👥 Всего тестировалось: ${users.size} чел.\n` +
-        `📝 Всего завершено тестов: ${totalTests}\n` +
-        `📅 Тестов за сегодня: ${todayTests.length}`
-      );
+      const stats = await getDetailedStats();
+      let response = `📊 **Статистика бота:**\n`;
+      response += `👥 Всего тестировалось: ${stats.users} чел.\n`;
+      response += `📝 Всего завершено тестов: ${stats.total}\n`;
+      response += `📅 Тестов за сегодня: ${stats.today}\n\n`;
+      response += `📈 **По темам:**\n`;
+      for (const [subject, count] of Object.entries(stats.bySubject)) {
+        response += `  • ${getSubjectDisplay(subject)}: ${count}\n`;
+      }
+      response += `\n📋 **По режимам:**\n`;
+      response += `  • Все вопросы: ${stats.byMode.normal || 0}\n`;
+      response += `  • Тестовый (10 вопросов): ${stats.byMode.test || 0}\n\n`;
+      response += `🏆 **Топ-5 пользователей:**\n`;
+      stats.topUsers.forEach((u, i) => {
+        response += `  ${i+1}. ID: ${u.userId} — ${u.count} тестов\n`;
+      });
+      await sendMessage(userId, response);
     } catch (err) {
-      await sendMessage(userId, 'Ошибка чтения статистики.');
-      logger.error(userId, err.message, 'stats');
+      await sendMessage(userId, 'Ошибка получения статистики.');
+      logger.error(userId, err.message, 'stats_detailed');
     }
     return res.sendStatus(200);
   }
 
-  // Обработка остальных текстовых сообщений через общую логику
+  if (text === '/check_size') {
+    if (String(userId) !== ADMIN_ID) {
+      await sendMessage(userId, '⛔ Команда только для администратора.');
+      return res.sendStatus(200);
+    }
+    try {
+      const stats = await fsPromises.stat(DB_PATH);
+      const sizeMB = stats.size / 1024 / 1024;
+      await sendMessage(userId, `📦 Размер базы данных: **${sizeMB.toFixed(1)} МБ**`);
+    } catch (err) {
+      await sendMessage(userId, 'Ошибка получения размера БД.');
+    }
+    return res.sendStatus(200);
+  }
+
   await processUserAction(userId, text);
   res.sendStatus(200);
 }
 
 // ============================
-//  9.  РЕГИСТРАЦИЯ ВЕБХУКА
+//  10. РЕГИСТРАЦИЯ ВЕБХУКА
 // ============================
 async function registerWebhook(url) {
   try {
@@ -587,7 +673,7 @@ async function registerWebhook(url) {
 }
 
 // ============================
-//  10. ЗАПУСК СЕРВЕРА
+//  11. ЗАПУСК СЕРВЕРА
 // ============================
 const app = express();
 app.use(express.json());
@@ -597,6 +683,16 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Сервер запущен на порту ${PORT}`);
   console.log(`   Ожидаем вебхуки на /webhook`);
+
+  // Проверка размера БД при старте
+  setTimeout(async () => {
+    await checkDbSize();
+  }, 5000);
+
+  // Периодическая проверка (раз в сутки)
+  setInterval(async () => {
+    await checkDbSize();
+  }, 24 * 60 * 60 * 1000);
 
   const webhookUrl = process.env.WEBHOOK_URL;
   if (webhookUrl) {
