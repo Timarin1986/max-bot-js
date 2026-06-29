@@ -316,7 +316,7 @@ async function sendQuestion(userId) {
   const keyboard = {
     keyboard: qData.options.map((_, i) => [{
       text: String(i+1),
-      callback_data: `q${qIndex}_${i+1}`,   // ✅ теперь payload содержит номер вопроса
+      callback_data: `q${qIndex}_${i+1}`,
     }]),
   };
   keyboard.keyboard.push([{ text: '🚫 Прервать тестирование', callback_data: 'cancel' }]);
@@ -331,8 +331,8 @@ async function handleAnswer(userId, text) {
   // Обработка "отмены"
   if (text === 'cancel' || text === '🚫 Прервать тестирование') {
     sessions.delete(userId);
-    await sendMessage(userId, 'Тестирование прервано. Для начала нового используйте /start');
     logger.action(userId, 'interrupt', session.subject);
+    await handleStart(userId); // ✅ вместо отдельного сообщения
     return;
   }
 
@@ -348,9 +348,8 @@ async function handleAnswer(userId, text) {
 
   // Проверяем, что ответ относится к текущему вопросу
   if (questionIndex !== session.currentQuestion) {
-    // Игнорируем старый ответ и просим ответить на текущий
     await sendMessage(userId, '⏳ Этот ответ уже не актуален. Ответьте на текущий вопрос.');
-    await sendQuestion(userId); // обновляем клавиатуру
+    await sendQuestion(userId);
     return;
   }
 
