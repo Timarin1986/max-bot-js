@@ -6,8 +6,8 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { appendFile } from 'fs';
 
-// Разрешаем самоподписанные сертификаты (только для тестов с localtunnel)
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+// Для продакшена лучше удалить или закомментировать:
+// process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 dotenv.config();
 
@@ -252,6 +252,40 @@ async function handleSubjectSelection(chatId, userId, text) {
   );
 }
 
+// НОВАЯ ФУНКЦИЯ: запуск теста по заданной теме и режиму
+async function startTest(chatId, userId, subject, mode) {
+  const questions = questionsData[subject];
+  if (!questions || questions.length === 0) {
+    await sendMessage(chatId, 'По этой теме нет вопросов. Попробуйте другую тему.');
+    return;
+  }
+
+  let sequence;
+  if (mode === 'normal') {
+    sequence = questions.map((_, i) => i);
+  } else { // test
+    const count = Math.min(10, questions.length);
+    const shuffled = [...Array(questions.length).keys()];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    sequence = shuffled.slice(0, count);
+  }
+
+  const session = {
+    state: 'ANSWERING',
+    subject: subject,
+    mode: mode,
+    currentQuestion: 0,
+    score: 0,
+    questions: sequence,
+  };
+  sessions.set(userId, session);
+  logger.action(userId, 'start_test', subject, mode);
+  await sendQuestion(chatId, userId);
+}
+
 async function handleModeSelection(chatId, userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
@@ -263,34 +297,11 @@ async function handleModeSelection(chatId, userId, text) {
     return;
   }
 
-  session.mode = isNormal ? 'normal' : 'test';
+  const mode = isNormal ? 'normal' : 'test';
+  const subject = session.subject;
 
-  const questions = questionsData[session.subject];
-  if (!questions || questions.length === 0) {
-    await sendMessage(chatId, 'По этой теме нет вопросов. Попробуйте другую тему.');
-    return;
-  }
-
-  let sequence;
-  if (isNormal) {
-    sequence = questions.map((_, i) => i);
-  } else {
-    const count = Math.min(10, questions.length);
-    const shuffled = [...Array(questions.length).keys()];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    sequence = shuffled.slice(0, count);
-  }
-
-  session.questions = sequence;
-  session.currentQuestion = 0;
-  session.score = 0;
-  session.state = 'ANSWERING';
-  logger.action(userId, 'select_mode', session.subject, isNormal ? 'normal' : 'test');
-
-  await sendQuestion(chatId, userId);
+  // Запускаем тест через новую функцию
+  await startTest(chatId, userId, subject, mode);
 }
 
 async function sendQuestion(chatId, userId) {
@@ -363,17 +374,25 @@ async function handleAnswer(chatId, userId, text) {
       grade = 'Неудовлетворительно 😔';
     }
 
-    const result =
+    // ИЗМЕНЕНО: две кнопки вместо текста
+    const resultText =
       `🏁 **Тестирование завершено!**\n\n` +
       `📊 Результаты по теме '${getSubjectName(session.subject)}':\n` +
       `• Правильных ответов: ${score}/${total}\n` +
       `• Процент выполнения: ${percentage.toFixed(1)}%\n` +
       `• Оценка: ${grade}\n\n` +
-      `Для начала нового тестирования нажмите /start`;
+      `Выберите действие:`;
+
+    const keyboard = {
+      keyboard: [
+        [{ text: '🔄 Пройти ещё раз', callback_data: `retry:${session.subject}:${session.mode}` }],
+        [{ text: '📋 Выбрать другую тему', callback_data: 'choose_subject' }]
+      ]
+    };
 
     logger.result(userId, session.subject, score, total, percentage);
     sessions.delete(userId);
-    await sendMessage(chatId, result);
+    await sendMessage(chatId, resultText, keyboard);
   } else {
     await sendQuestion(chatId, userId);
   }
@@ -399,6 +418,30 @@ async function handleWebhook(req, res) {
     }
 
     console.log(`👤 Callback от пользователя ${userId}, payload: "${payload}"`);
+
+    // --- НОВЫЕ ОБРАБОТЧИКИ для кнопок результата ---
+    if (text === 'choose_subject') {
+      await showSubjects(chatId, userId);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('retry:')) {
+      const parts = text.split(':');
+      if (parts.length === 3) {
+        const subject = parts[1];
+        const mode = parts[2];
+        if (questionsData[subject]) {
+          await startTest(chatId, userId, subject, mode);
+        } else {
+          await sendMessage(chatId, 'Тема не найдена. Выберите тему заново.');
+          await showSubjects(chatId, userId);
+        }
+      } else {
+        await sendMessage(chatId, 'Ошибка формата. Попробуйте снова.');
+      }
+      return res.sendStatus(200);
+    }
+    // ---------------------------------------------
 
     if (text === '/start' || text === '/cancel') {
       await handleStart(chatId, userId);
