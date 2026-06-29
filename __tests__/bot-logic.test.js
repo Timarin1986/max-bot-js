@@ -65,8 +65,9 @@ describe('Бизнес-логика', () => {
       score: 0,
       questions: twoQuestionsIndices
     });
-    const correctAnswer = testQuestions[0].correct + 1;
-    await handleAnswer(userId, String(correctAnswer));
+    const correctAnswerNum = testQuestions[0].correct + 1;
+    const payload = `q0_${correctAnswerNum}`;
+    await handleAnswer(userId, payload);
     const session = sessions.get(userId);
     expect(session).toBeDefined();
     expect(session.score).toBe(1);
@@ -82,8 +83,10 @@ describe('Бизнес-логика', () => {
       score: 0,
       questions: twoQuestionsIndices
     });
-    const wrongAnswer = (testQuestions[0].correct === 0) ? 2 : 1;
-    await handleAnswer(userId, String(wrongAnswer));
+    const correctAnswerNum = testQuestions[0].correct + 1;
+    const wrongAnswerNum = correctAnswerNum === 1 ? 2 : 1;
+    const payload = `q0_${wrongAnswerNum}`;
+    await handleAnswer(userId, payload);
     const session = sessions.get(userId);
     expect(session).toBeDefined();
     expect(session.score).toBe(0);
@@ -99,8 +102,10 @@ describe('Бизнес-логика', () => {
       score: 0,
       questions: oneQuestionIndex
     });
-    const answer = (testQuestions[0].correct === 0) ? 2 : 1;
-    await handleAnswer(userId, String(answer));
+    const correctAnswerNum = testQuestions[0].correct + 1;
+    const wrongAnswerNum = correctAnswerNum === 1 ? 2 : 1;
+    const payload = `q0_${wrongAnswerNum}`;
+    await handleAnswer(userId, payload);
     expect(sessions.has(userId)).toBe(false);
     expect(axiosPostMock).toHaveBeenCalled();
   });

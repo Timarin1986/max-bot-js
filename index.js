@@ -48,7 +48,6 @@ async function saveStatsEntry(userId, subject, mode, score, total, percentage) {
     await fsPromises.appendFile(STATS_FILE, entry, 'utf8');
   } catch (err) {
     console.error('❌ Ошибка записи stats.jsonl:', err);
-    // fallback в лог ошибок
     const logDir = join('/tmp', 'logs');
     if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
     await fsPromises.appendFile(
@@ -146,7 +145,6 @@ const writeLog = (filename, data) => {
 const logger = {
   action: (userId, action, subject = null, detail = null) => writeLog('actions.log', { userId, action, subject, detail }),
   result: (userId, subject, mode, score, total, percentage) => {
-    // fire-and-forget
     saveStatsEntry(userId, subject, mode, score, total, percentage)
       .catch(err => console.error('❌ Ошибка сохранения статистики:', err));
     writeLog('results.log', { userId, subject, mode, score, total, percentage });
@@ -225,7 +223,7 @@ const sessions = new Map();
 
 async function handleStart(userId) {
   logger.user(userId);
-  await sendMessage(userId, 'Добро пожаловать в систему тестирования по промышленной безопасности!\n\nНажмите "Начать", чтобы выбрать тему.', {
+  await sendMessage(userId, '**Добро пожаловать в систему подготовки к проверке знаний по промышленной безопасности и охране труда!** 🛡️\n\nЭтот бот поможет вам проверить свои знания по ключевым темам. Нажмите "Начать тестирование", чтобы выбрать тему.', {
     keyboard: [[{ text: '▶️ Начать тестирование', callback_data: 'start_test' }]]
   });
 }
@@ -306,36 +304,64 @@ async function handleModeSelection(userId, text) {
 async function sendQuestion(userId) {
   const session = sessions.get(userId);
   if (!session) return;
+
   const qIndex = session.currentQuestion;
   const questions = questionsData[session.subject];
   const qData = questions[session.questions[qIndex]];
   const total = session.questions.length;
+
   const text = `❓ **Вопрос ${qIndex + 1} из ${total}**\n\n${qData.question}`;
   const optionsText = qData.options.map((opt, i) => `${i+1}. ${opt}`).join('\n');
+
   const keyboard = {
-    keyboard: qData.options.map((_, i) => [{ text: String(i+1), callback_data: String(i+1) }])
+    keyboard: qData.options.map((_, i) => [{
+      text: String(i+1),
+      callback_data: `q${qIndex}_${i+1}`,   // ✅ теперь payload содержит номер вопроса
+    }]),
   };
   keyboard.keyboard.push([{ text: '🚫 Прервать тестирование', callback_data: 'cancel' }]);
+
   await sendMessage(userId, `${text}\n\n${optionsText}`, keyboard);
 }
 
 async function handleAnswer(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
+
+  // Обработка "отмены"
   if (text === 'cancel' || text === '🚫 Прервать тестирование') {
     sessions.delete(userId);
     await sendMessage(userId, 'Тестирование прервано. Для начала нового используйте /start');
     logger.action(userId, 'interrupt', session.subject);
     return;
   }
-  const answerNum = parseInt(text, 10);
+
+  // Парсим payload вида "q{номер вопроса}_{номер ответа}"
+  const match = text.match(/^q(\d+)_(\d+)$/);
+  if (!match) {
+    await sendMessage(userId, 'Неверный формат ответа. Пожалуйста, используйте кнопки.');
+    return;
+  }
+
+  const questionIndex = parseInt(match[1], 10);
+  const answerNum = parseInt(match[2], 10);
+
+  // Проверяем, что ответ относится к текущему вопросу
+  if (questionIndex !== session.currentQuestion) {
+    // Игнорируем старый ответ и просим ответить на текущий
+    await sendMessage(userId, '⏳ Этот ответ уже не актуален. Ответьте на текущий вопрос.');
+    await sendQuestion(userId); // обновляем клавиатуру
+    return;
+  }
+
   const questions = questionsData[session.subject];
-  const qIndex = session.currentQuestion;
-  const qData = questions[session.questions[qIndex]];
+  const qData = questions[session.questions[questionIndex]];
+
   if (isNaN(answerNum) || answerNum < 1 || answerNum > qData.options.length) {
     await sendMessage(userId, 'Пожалуйста, выберите номер ответа (нажмите на кнопку с цифрой).');
     return;
   }
+
   const isCorrect = (answerNum - 1) === qData.correct;
   if (isCorrect) {
     session.score += 1;
@@ -343,7 +369,9 @@ async function handleAnswer(userId, text) {
   } else {
     await sendMessage(userId, `❌ **Неправильно!**\nПравильный ответ: ${qData.options[qData.correct]}`);
   }
+
   session.currentQuestion += 1;
+
   if (session.currentQuestion >= session.questions.length) {
     const total = session.questions.length;
     const score = session.score;
