@@ -186,7 +186,6 @@ async function callAPI(method, params = {}) {
   }
 }
 
-// Добавляем параметр escape (по умолчанию true)
 async function sendMessage(userId, text, replyMarkup = null, escape = true) {
   const safeText = escape ? escapeMarkdown(text) : text;
   const params = { text: safeText, format: 'markdown' };
@@ -209,27 +208,72 @@ function escapeMarkdown(text) {
 }
 
 // ============================
-//  6.  ВСПОМОГАТЕЛЬНЫЕ
+//  6.  ВСПОМОГАТЕЛЬНЫЕ (КАРТЫ ОТОБРАЖЕНИЯ – 26 ТЕМ)
 // ============================
 function getSubjectDisplay(key) {
   const map = {
+    // Старые темы
     natural_gas_questions: '🔥 Природный газ',
     ammonia_questions: '☠️ Аммиак',
     acetylene_questions: '⚡ Ацетилен/Кислород',
     chlorine_questions: '☣️ Хлор',
     work_platforms_questions: '🛗 Люльки',
     pressure_vessels_questions: '⚓ Сосуды под давлением',
+    // Новые темы
+    v_cart_crane_questions: '🏗️ V-карт (крановщик)',
+    acetylene_station_questions: '🧪 Ацетиленовая станция',
+    explosion_safety_questions: '💥 Взрывобезопасность',
+    instrumentation_and_automation_workers_questions: '📊 КИПиА (рабочие)',
+    acids_and_alkalis_workers_questions: '🧪 Кислоты и щелочи (рабочие)',
+    paints_varnishes_solvents_production_questions: '🎨 КПО (лаки, краски, растворители)',
+    bridge_crane_operator_questions: '🏗️ Крановщик мостового крана',
+    jib_crane_operator_questions: '🏗️ Крановщик стрелового крана',
+    elevator_operators_questions: '🛗 Лифтёры',
+    stacker_crane_operator_questions: '🏗️ Машинист кранов-штабелеров',
+    aerial_platform_operator_questions: '🛗 Машинист подъёмника',
+    monorail_trolleys_questions: '🚟 Монорельсовые тележки',
+    lifting_equipment_operators_remote_control_questions: '🎮 Операторы ПС с пульта',
+    lifting_equipment_mechanic_questions: '🔧 Слесарь ПС',
+    melts_and_alloys_repair_questions: '🔥 Сплавы и расплавы (ремонт)',
+    melts_and_alloys_operation_questions: '🔥 Сплавы и расплавы (эксплуатация)',
+    rigger_questions: '🪢 Стропальщик',
+    gas_cylinders_transport_and_operation_questions: '🧯 Газовые баллоны (транспорт, эксплуатация)',
+    steam_and_hot_water_pipelines_questions: '♨️ Трубопроводы пара и горячей воды',
+    electricians_questions: '⚡ Электромонтёры',
   };
   return map[key] || key.replace(/_questions$/, '').replace(/_/g, ' ');
 }
+
 function getSubjectName(key) {
   const map = {
+    // Старые темы
     natural_gas_questions: 'природному газу',
     ammonia_questions: 'аммиаку',
     acetylene_questions: 'ацетилену и кислороду',
     chlorine_questions: 'хлору',
     work_platforms_questions: 'подъемникам (люлькам)',
     pressure_vessels_questions: 'сосудам под давлением',
+    // Новые темы
+    v_cart_crane_questions: 'V-карту (крановщик)',
+    acetylene_station_questions: 'ацетиленовой станции',
+    explosion_safety_questions: 'взрывобезопасности',
+    instrumentation_and_automation_workers_questions: 'КИПиА (рабочие)',
+    acids_and_alkalis_workers_questions: 'кислотам и щелочам (рабочие)',
+    paints_varnishes_solvents_production_questions: 'КПО (лаки, краски, растворители)',
+    bridge_crane_operator_questions: 'крановщику мостового крана',
+    jib_crane_operator_questions: 'крановщику стрелового крана',
+    elevator_operators_questions: 'лифтёрам',
+    stacker_crane_operator_questions: 'машинисту кранов-штабелеров',
+    aerial_platform_operator_questions: 'машинисту подъёмника',
+    monorail_trolleys_questions: 'монорельсовым тележкам',
+    lifting_equipment_operators_remote_control_questions: 'операторам ПС с пульта',
+    lifting_equipment_mechanic_questions: 'слесарю ПС',
+    melts_and_alloys_repair_questions: 'сплавам и расплавам (ремонт)',
+    melts_and_alloys_operation_questions: 'сплавам и расплавам (эксплуатация)',
+    rigger_questions: 'стропальщику',
+    gas_cylinders_transport_and_operation_questions: 'газовым баллонам (транспорт, эксплуатация)',
+    steam_and_hot_water_pipelines_questions: 'трубопроводам пара и горячей воды',
+    electricians_questions: 'электромонтёрам',
   };
   return map[key] || key.replace(/_questions$/, '');
 }
@@ -241,12 +285,11 @@ const sessions = new Map();
 
 async function handleStart(userId) {
   logger.user(userId);
-  // Статическое приветствие с разметкой – экранирование отключаем
   await sendMessage(
     userId,
     '**Добро пожаловать в систему подготовки к проверке знаний по промышленной безопасности и охране труда!** 🛡️\n\nЭтот бот поможет вам проверить свои знания по ключевым темам. Нажмите "Начать тестирование", чтобы выбрать тему.',
     { keyboard: [[{ text: '▶️ Начать тестирование', callback_data: 'start_test' }]] },
-    false
+    false // отключаем экранирование для этой статической строки с разметкой
   );
 }
 
@@ -270,7 +313,6 @@ async function handleSubjectSelection(userId, text) {
   session.subject = selected;
   session.state = 'SELECTING_MODE';
   logger.action(userId, 'select_subject', selected);
-  // Название темы экранируем, остальной текст с разметкой оставляем
   const subjectName = escapeMarkdown(getSubjectName(selected));
   await sendMessage(
     userId,
@@ -282,7 +324,7 @@ async function handleSubjectSelection(userId, text) {
         [{ text: '◀️ Назад', callback_data: 'back_to_subjects' }]
       ]
     },
-    false
+    false // не экранируем, т.к. уже экранировали subjectName отдельно
   );
 }
 
@@ -359,15 +401,17 @@ async function handleAnswer(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
+  // Защита от гонок
   if (session.processing) {
     await sendMessage(userId, '⏳ Подождите, ваш предыдущий ответ ещё обрабатывается.');
     return;
   }
 
+  // Обработка "отмены"
   if (text === 'cancel' || text === '🚫 Прервать тестирование') {
     sessions.delete(userId);
     logger.action(userId, 'interrupt', session.subject);
-    await handleStart(userId);
+    await handleStart(userId); // сразу показываем стартовое меню
     return;
   }
 
@@ -382,6 +426,7 @@ async function handleAnswer(userId, text) {
     const questionIndex = parseInt(match[1], 10);
     const answerNum = parseInt(match[2], 10);
 
+    // Проверка, что ответ на текущий вопрос
     if (questionIndex !== session.currentQuestion) {
       await sendMessage(userId, '⏳ Этот ответ уже не актуален. Ответьте на текущий вопрос.');
       await sendQuestion(userId);
@@ -412,6 +457,7 @@ async function handleAnswer(userId, text) {
 
     session.currentQuestion += 1;
 
+    // Проверка завершения теста
     if (session.currentQuestion >= session.questions.length) {
       const total = session.questions.length;
       const score = session.score;
@@ -553,7 +599,7 @@ async function handleWebhook(req, res) {
       stats.topUsers.forEach((u, i) => {
         response += `  ${i+1}. ID: ${u.userId} — ${u.count} тестов\n`;
       });
-      await sendMessage(userId, response, null, false); // статистика без Markdown, но экранирование отключаем (она не содержит опасных символов)
+      await sendMessage(userId, response, null, false); // статистика не содержит спецсимволов, но для надёжности false
     } catch (err) {
       await sendMessage(userId, 'Ошибка получения статистики.');
       logger.error(userId, err.message, 'stats');
