@@ -208,7 +208,7 @@ function escapeMarkdown(text) {
 }
 
 // ============================
-//  6.  ВСПОМОГАТЕЛЬНЫЕ (КАРТЫ ОТОБРАЖЕНИЯ – 26 ТЕМ)
+//  6.  КАРТЫ ОТОБРАЖЕНИЯ – 27 ТЕМ
 // ============================
 function getSubjectDisplay(key) {
   const map = {
@@ -219,7 +219,7 @@ function getSubjectDisplay(key) {
     chlorine_questions: '☣️ Хлор',
     work_platforms_questions: '🛗 Люльки',
     pressure_vessels_questions: '⚓ Сосуды под давлением',
-    // Новые темы
+    // Новые темы (20 штук)
     v_cart_crane_questions: '🏗️ V-карт (крановщик)',
     acetylene_station_questions: '🧪 Ацетиленовая станция',
     explosion_safety_questions: '💥 Взрывобезопасность',
@@ -240,6 +240,8 @@ function getSubjectDisplay(key) {
     gas_cylinders_transport_and_operation_questions: '🧯 Газовые баллоны (транспорт, эксплуатация)',
     steam_and_hot_water_pipelines_questions: '♨️ Трубопроводы пара и горячей воды',
     electricians_questions: '⚡ Электромонтёры',
+    // Новая тема «Работы на высоте»
+    height_work_questions: '🪜 Работы на высоте',
   };
   return map[key] || key.replace(/_questions$/, '').replace(/_/g, ' ');
 }
@@ -253,7 +255,7 @@ function getSubjectName(key) {
     chlorine_questions: 'хлору',
     work_platforms_questions: 'подъемникам (люлькам)',
     pressure_vessels_questions: 'сосудам под давлением',
-    // Новые темы
+    // Новые темы (20 штук)
     v_cart_crane_questions: 'V-карту (крановщик)',
     acetylene_station_questions: 'ацетиленовой станции',
     explosion_safety_questions: 'взрывобезопасности',
@@ -274,6 +276,8 @@ function getSubjectName(key) {
     gas_cylinders_transport_and_operation_questions: 'газовым баллонам (транспорт, эксплуатация)',
     steam_and_hot_water_pipelines_questions: 'трубопроводам пара и горячей воды',
     electricians_questions: 'электромонтёрам',
+    // Новая тема
+    height_work_questions: 'работам на высоте',
   };
   return map[key] || key.replace(/_questions$/, '');
 }
@@ -289,7 +293,7 @@ async function handleStart(userId) {
     userId,
     '**Добро пожаловать в систему подготовки к проверке знаний по промышленной безопасности и охране труда!** 🛡️\n\nЭтот бот поможет вам проверить свои знания по ключевым темам. Нажмите "Начать тестирование", чтобы выбрать тему.',
     { keyboard: [[{ text: '▶️ Начать тестирование', callback_data: 'start_test' }]] },
-    false // отключаем экранирование для этой статической строки с разметкой
+    false
   );
 }
 
@@ -324,7 +328,7 @@ async function handleSubjectSelection(userId, text) {
         [{ text: '◀️ Назад', callback_data: 'back_to_subjects' }]
       ]
     },
-    false // не экранируем, т.к. уже экранировали subjectName отдельно
+    false
   );
 }
 
@@ -393,7 +397,6 @@ async function sendQuestion(userId) {
   };
   keyboard.keyboard.push([{ text: '🚫 Прервать тестирование', callback_data: 'cancel' }]);
 
-  // Вопросы и варианты могут содержать спецсимволы – экранируем
   await sendMessage(userId, `${text}\n\n${optionsText}`, keyboard);
 }
 
@@ -401,17 +404,15 @@ async function handleAnswer(userId, text) {
   const session = sessions.get(userId);
   if (!session) return;
 
-  // Защита от гонок
   if (session.processing) {
     await sendMessage(userId, '⏳ Подождите, ваш предыдущий ответ ещё обрабатывается.');
     return;
   }
 
-  // Обработка "отмены"
   if (text === 'cancel' || text === '🚫 Прервать тестирование') {
     sessions.delete(userId);
     logger.action(userId, 'interrupt', session.subject);
-    await handleStart(userId); // сразу показываем стартовое меню
+    await handleStart(userId);
     return;
   }
 
@@ -426,7 +427,6 @@ async function handleAnswer(userId, text) {
     const questionIndex = parseInt(match[1], 10);
     const answerNum = parseInt(match[2], 10);
 
-    // Проверка, что ответ на текущий вопрос
     if (questionIndex !== session.currentQuestion) {
       await sendMessage(userId, '⏳ Этот ответ уже не актуален. Ответьте на текущий вопрос.');
       await sendQuestion(userId);
@@ -457,7 +457,6 @@ async function handleAnswer(userId, text) {
 
     session.currentQuestion += 1;
 
-    // Проверка завершения теста
     if (session.currentQuestion >= session.questions.length) {
       const total = session.questions.length;
       const score = session.score;
@@ -575,7 +574,6 @@ async function handleWebhook(req, res) {
   const text = msg.body?.text || '';
   if (!userId) return res.sendStatus(200);
 
-  // Админские команды
   if (text === '/stats') {
     if (String(userId) !== ADMIN_ID) {
       await sendMessage(userId, '⛔ Команда только для администратора.');
@@ -599,7 +597,7 @@ async function handleWebhook(req, res) {
       stats.topUsers.forEach((u, i) => {
         response += `  ${i+1}. ID: ${u.userId} — ${u.count} тестов\n`;
       });
-      await sendMessage(userId, response, null, false); // статистика не содержит спецсимволов, но для надёжности false
+      await sendMessage(userId, response, null, false);
     } catch (err) {
       await sendMessage(userId, 'Ошибка получения статистики.');
       logger.error(userId, err.message, 'stats');
@@ -650,7 +648,6 @@ async function registerWebhook(url) {
   }
 }
 
-// Запуск сервера только если не в тестовом режиме
 if (process.env.NODE_ENV !== 'test') {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, async () => {
@@ -671,9 +668,6 @@ if (process.env.NODE_ENV !== 'test') {
   });
 }
 
-// ============================
-//  ЭКСПОРТЫ ДЛЯ ТЕСТОВ
-// ============================
 export { 
   handleStart, showSubjects, handleSubjectSelection, handleModeSelection, 
   startTest, handleAnswer, processUserAction, handleWebhook,
